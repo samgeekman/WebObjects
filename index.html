@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DayZ Box Editor</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script async src="https://unpkg.com/es-module-shims@1.10.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.161.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.161.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app">
+      <aside class="panel left">
+        <h1>DayZ Box Editor</h1>
+        <label class="field">
+          <span>Search object</span>
+          <input id="searchInput" placeholder="fuelstation, garage, fence..." />
+        </label>
+        <div id="objectList" class="object-list"></div>
+      </aside>
+
+      <main id="viewportWrap">
+        <canvas id="viewport"></canvas>
+        <div id="dropHint">Drop object to place box</div>
+      </main>
+
+      <aside class="panel right">
+        <h2>Selection</h2>
+        <div id="selectionInfo" class="muted">No object selected.</div>
+
+        <h3>Placement</h3>
+        <p class="muted">Drag an image tile from the left panel and drop it onto the plane to place.</p>
+
+        <h3>Transform</h3>
+        <div class="row">
+          <button data-mode="translate">Move</button>
+          <button data-mode="rotate">Rotate</button>
+          <button data-mode="scale">Scale</button>
+        </div>
+        <h3>Controls</h3>
+        <img class="legend-image" src="./public/images/controls-legend.svg" alt="Control legend for icons and keys" />
+        <p class="muted">Icons: move, rotate, scale. Camera keys: W/A/S/D/Q/Z. Press Space to toggle mouselook/cursor mode.</p>
+
+        <h3>Dimensions (meters)</h3>
+        <div class="grid3">
+          <label>X <input id="dimX" type="number" step="0.01" /></label>
+          <label>Y <input id="dimY" type="number" step="0.01" /></label>
+          <label>Z <input id="dimZ" type="number" step="0.01" /></label>
+        </div>
+        <button id="applyDims">Apply Dimensions</button>
+
+        <h3>Scene</h3>
+        <div class="row">
+          <button id="exportScene">Export JSON</button>
+          <button id="undoAction">Undo</button>
+          <label class="file-input">
+            Import JSON
+            <input id="importScene" type="file" accept="application/json" />
+          </label>
+        </div>
+        <button id="deleteSelected">Delete Selected</button>
+      </aside>
+    </div>
+
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
