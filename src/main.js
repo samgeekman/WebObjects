@@ -16,6 +16,7 @@ const ui = {
   dimZ: document.getElementById('dimZ'),
   applyDims: document.getElementById('applyDims'),
   exportScene: document.getElementById('exportScene'),
+  copyExport: document.getElementById('copyExport'),
   undoAction: document.getElementById('undoAction'),
   importScene: document.getElementById('importScene'),
   deleteSelected: document.getElementById('deleteSelected'),
@@ -606,6 +607,11 @@ function exportDayzEditorJson() {
       Flags: 30,
     };
   });
+  return out;
+}
+
+function downloadDayzEditorJson() {
+  const out = exportDayzEditorJson();
 
   const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -614,6 +620,38 @@ function exportDayzEditorJson() {
   a.download = 'dayz-editor-export.json';
   a.click();
   URL.revokeObjectURL(url);
+}
+
+async function copyDayzExportToClipboard() {
+  const out = exportDayzEditorJson();
+  const text = JSON.stringify(out, null, 2);
+
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    const original = ui.copyExport.textContent;
+    ui.copyExport.textContent = 'Copied';
+    setTimeout(() => {
+      ui.copyExport.textContent = original;
+    }, 1000);
+  } catch {
+    const original = ui.copyExport.textContent;
+    ui.copyExport.textContent = 'Copy failed';
+    setTimeout(() => {
+      ui.copyExport.textContent = original;
+    }, 1200);
+  }
 }
 
 function exportSceneJson() {
@@ -800,7 +838,8 @@ ui.applyDims.addEventListener('click', () => {
   }
 });
 
-ui.exportScene.addEventListener('click', exportDayzEditorJson);
+ui.exportScene.addEventListener('click', downloadDayzEditorJson);
+ui.copyExport.addEventListener('click', copyDayzExportToClipboard);
 ui.undoAction.addEventListener('click', undoLastAction);
 
 ui.importScene.addEventListener('change', async (event) => {
