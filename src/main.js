@@ -2,7 +2,11 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 
-const catalogUrl = './public/data/objects.min.json';
+const catalogSources = [
+  'https://samsobjectfinder.com/api/v1/objects.full.json',
+  'https://samsobjectfinder.com/static/api/v1/objects.full.json',
+  './public/data/objects.min.json',
+];
 const FLOOR_Y = 0;
 
 const ui = {
@@ -44,6 +48,7 @@ const state = {
   isTransformDragging: false,
   lookYaw: 0,
   lookPitch: 0,
+  catalogSource: null,
 };
 
 const renderer = new THREE.WebGLRenderer({ canvas: ui.canvas, antialias: true });
@@ -254,6 +259,26 @@ function normalizeBoxData(obj) {
   }
 
   return { dims, center };
+}
+
+function normalizeCatalogEntry(item) {
+  const dims = Array.isArray(item?.dimensionsVisual) && item.dimensionsVisual.length === 3
+    ? item.dimensionsVisual.map((n) => Number(n) || 2.5)
+    : [2.5, 2.5, 2.5];
+
+  return {
+    objectName: item?.objectName || item?.Type || 'unknown_object',
+    inGameName: item?.inGameName || '-',
+    category: item?.category || 'Uncategorized',
+    path: item?.path || '',
+    imageUrl: item?.imageUrl || '',
+    image: item?.image || '',
+    bboxStatus: item?.bboxStatus || 'unknown',
+    dimensionsSource: item?.dimensionsSource || 'unknown',
+    dimensionsVisual: dims,
+    bboxMinVisual: Array.isArray(item?.bboxMinVisual) ? item.bboxMinVisual : null,
+    bboxMaxVisual: Array.isArray(item?.bboxMaxVisual) ? item.bboxMaxVisual : null,
+  };
 }
 
 function pushUndo(undoFn) {
@@ -932,17 +957,32 @@ document.addEventListener('mousemove', (event) => {
 });
 
 async function loadCatalog() {
-  try {
-    const res = await fetch(catalogUrl);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    state.catalog = await res.json();
+  let lastError = null;
+  for (const source of catalogSources) {
+    try {
+      const res = await fetch(source, { cache: 'no-cache' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const payload = await res.json();
+      if (!Array.isArray(payload)) throw new Error('Catalog payload is not an array');
 
-    state.catalog.sort((a, b) => (a.objectName || '').localeCompare(b.objectName || ''));
-    state.filtered = state.catalog;
-    renderCatalog();
+      state.catalog = payload.map(normalizeCatalogEntry);
+      state.catalog.sort((a, b) => (a.objectName || '').localeCompare(b.objectName || ''));
+      state.filtered = state.catalog;
+      state.catalogSource = source;
+      renderCatalog();
+      ui.selectionInfo.textContent = `Catalog loaded: ${state.catalog.length.toLocaleString()} objects (${source})`;
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  try {
+    throw lastError || new Error('No catalog source could be loaded');
   } catch (error) {
-    ui.list.innerHTML = '<div class="muted">Failed to load catalog. Run scripts/build-object-catalog.sh first.</div>';
-    console.error(error);
+    ui.list.innerHTML = '<div class="muted">Failed to load catalog from SamsObjectFinder API or local file.</div>';
+    ui.selectionInfo.textContent = 'Catalog load failed.';
+    console.error('Catalog load failed:', error);
   }
 }
 
