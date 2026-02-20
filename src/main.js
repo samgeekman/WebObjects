@@ -17,6 +17,10 @@ const ui = {
   placedList: document.getElementById('placedList'),
   search: document.getElementById('searchInput'),
   statusText: document.getElementById('statusText'),
+  moveSpeed: document.getElementById('moveSpeed'),
+  moveSpeedValue: document.getElementById('moveSpeedValue'),
+  sprintMultiplier: document.getElementById('sprintMultiplier'),
+  sprintMultiplierValue: document.getElementById('sprintMultiplierValue'),
   exportScene: document.getElementById('exportScene'),
   copyExport: document.getElementById('copyExport'),
   undoAction: document.getElementById('undoAction'),
@@ -49,12 +53,16 @@ const state = {
   lookPitch: 0,
   lookLastX: null,
   lookLastY: null,
+  lookEdgeSpinX: 0,
+  lookEdgeSpinY: 0,
   catalogSource: null,
   stickyCatalog: null,
   stickyPreview: null,
   placeEdgeEffects: [],
   placeImpactEffects: [],
   persistTimer: null,
+  moveSpeed: 12,
+  sprintMultiplier: 2.2,
 };
 
 const renderer = new THREE.WebGLRenderer({ canvas: ui.canvas, antialias: true });
@@ -81,7 +89,10 @@ transform.addEventListener('dragging-changed', (event) => {
   updateOrbitEnabled();
 });
 transform.addEventListener('objectChange', () => {
-  if (state.selectedPlaced) clampPlacedAboveFloor(state.selectedPlaced);
+  if (state.selectedPlaced) {
+    enforceUniformScale(state.selectedPlaced);
+    clampPlacedAboveFloor(state.selectedPlaced);
+  }
   syncSelectionFields();
 });
 transform.addEventListener('mouseDown', () => {
@@ -273,6 +284,13 @@ function normalizeBoxData(obj) {
 }
 
 function normalizeCatalogEntry(item) {
+  const stableId = (() => {
+    if (typeof item?.id === 'string' && item.id.trim()) return item.id.trim();
+    const name = String(item?.objectName || item?.Type || 'unknown_object').trim();
+    const path = String(item?.path || '').trim();
+    return `local:${path}|${name}`;
+  })();
+
   const dims = Array.isArray(item?.dimensionsVisual) && item.dimensionsVisual.length === 3
     ? item.dimensionsVisual.map((n) => Number(n) || 2.5)
     : [2.5, 2.5, 2.5];
@@ -281,9 +299,11 @@ function normalizeCatalogEntry(item) {
     && Array.isArray(item?.bboxMaxVisual);
 
   return {
+    stableId,
     objectName: item?.objectName || item?.Type || 'unknown_object',
     inGameName: item?.inGameName || '-',
     category: item?.category || 'Uncategorized',
+    modelType: item?.modelType || null,
     path: item?.path || '',
     imageUrl: item?.imageUrl || '',
     image: item?.image || '',
@@ -303,6 +323,9 @@ function serializePlacedObjects() {
       objectName: def.objectName || 'unknown_object',
       path: def.path || '',
       category: def.category || 'Imported',
+      modelType: def.modelType || null,
+      imageUrl: def.imageUrl || '',
+      image: def.image || '',
       bboxStatus: def.bboxStatus || 'unknown',
       dimensionsSource: def.dimensionsSource || 'unknown',
       dimensionsVisual: o.userData?.dims || def.dimensionsVisual || [2.5, 2.5, 2.5],
@@ -357,6 +380,9 @@ function restorePlacedObjectsFromStorage() {
       objectName: item.objectName || 'unknown_object',
       path: item.path || '',
       category: item.category || 'Imported',
+      modelType: item.modelType || null,
+      imageUrl: item.imageUrl || '',
+      image: item.image || '',
       bboxStatus: item.bboxStatus || 'unknown',
       dimensionsSource: item.dimensionsSource || 'unknown',
       dimensionsVisual: item.dimensionsVisual || [2.5, 2.5, 2.5],
@@ -375,6 +401,7 @@ function restorePlacedObjectsFromStorage() {
     if (Array.isArray(item.scale) && item.scale.length === 3) {
       placed.scale.set(Number(item.scale[0]) || 1, Number(item.scale[1]) || 1, Number(item.scale[2]) || 1);
     }
+    enforceUniformScale(placed);
     clampPlacedAboveFloor(placed);
     scene.add(placed);
     state.placedObjects.push(placed);
@@ -432,13 +459,24 @@ function clampPlacedAboveFloor(holder) {
   }
 }
 
+function enforceUniformScale(holder) {
+  if (!holder) return;
+  const sx = Number(holder.scale.x) || 1;
+  const sy = Number(holder.scale.y) || sx;
+  const sz = Number(holder.scale.z) || sx;
+  const uniform = (sx + sy + sz) / 3;
+  holder.scale.set(uniform, uniform, uniform);
+}
+
 function applyKeyboardNavigation(deltaSeconds) {
   const axisZ = (state.navKeys.w ? 1 : 0) - (state.navKeys.s ? 1 : 0);
   const axisX = (state.navKeys.d ? 1 : 0) - (state.navKeys.a ? 1 : 0);
   const axisY = (state.navKeys.q ? 1 : 0) - (state.navKeys.z ? 1 : 0);
   if (axisX === 0 && axisY === 0 && axisZ === 0) return;
 
-  const speed = (state.navKeys.shift ? 26 : 12) * deltaSeconds;
+  const baseSpeed = state.moveSpeed;
+  const boost = state.sprintMultiplier;
+  const speed = (state.navKeys.shift ? baseSpeed * boost : baseSpeed) * deltaSeconds;
   const forward = new THREE.Vector3();
   camera.getWorldDirection(forward);
   forward.y = 0;
@@ -583,6 +621,21 @@ function updateCameraModeUi() {
   setStatus(state.lookMode ? 'Cam mode' : 'Cursor mode');
 }
 
+function applyEdgeCameraSpin(deltaSeconds) {
+  if (!state.lookMode) return;
+  if (Math.abs(state.lookEdgeSpinX) < 1e-5 && Math.abs(state.lookEdgeSpinY) < 1e-5) return;
+
+  state.lookYaw -= state.lookEdgeSpinX * deltaSeconds;
+  state.lookPitch -= state.lookEdgeSpinY * deltaSeconds;
+  state.lookPitch = THREE.MathUtils.clamp(state.lookPitch, -Math.PI / 2 + 0.01, Math.PI / 2 - 0.01);
+  updateCameraFromLookAngles();
+
+  // Soft decay so spin stops quickly when user leaves the edge.
+  const decay = Math.max(0, 1 - deltaSeconds * 10);
+  state.lookEdgeSpinX *= decay;
+  state.lookEdgeSpinY *= decay;
+}
+
 function syncLookAnglesFromCamera() {
   const dir = new THREE.Vector3();
   camera.getWorldDirection(dir);
@@ -609,6 +662,8 @@ function enterLookMode() {
   state.lookMode = true;
   state.lookLastX = null;
   state.lookLastY = null;
+  state.lookEdgeSpinX = 0;
+  state.lookEdgeSpinY = 0;
   updateOrbitEnabled();
   updateCameraModeUi();
 }
@@ -618,6 +673,8 @@ function exitLookMode() {
   state.lookMode = false;
   state.lookLastX = null;
   state.lookLastY = null;
+  state.lookEdgeSpinX = 0;
+  state.lookEdgeSpinY = 0;
   updateOrbitEnabled();
   updateCameraModeUi();
 }
@@ -635,7 +692,7 @@ function renderCatalog() {
   for (const obj of state.filtered.slice(0, 300)) {
     const button = document.createElement('button');
     const imageUrl = getObjectImageUrl(obj);
-    const isActive = state.selectedCatalog?.objectName === obj.objectName || state.stickyCatalog?.objectName === obj.objectName;
+    const isActive = state.selectedCatalog?.stableId === obj.stableId || state.stickyCatalog?.stableId === obj.stableId;
     button.className = `object-item${isActive ? ' active' : ''}`;
     if (!obj.hasKnownDimensions) button.title = 'Dimensions unknown';
     button.draggable = true;
@@ -661,7 +718,7 @@ function renderCatalog() {
       clearStickyCatalog();
       renderCatalog();
       state.dragCatalog = obj;
-      event.dataTransfer?.setData('text/plain', obj.objectName);
+      event.dataTransfer?.setData('text/plain', obj.stableId || obj.objectName);
       if (event.dataTransfer) event.dataTransfer.effectAllowed = 'copy';
     });
     button.addEventListener('dragend', () => {
@@ -873,6 +930,7 @@ function applySnapshot(obj, snap) {
   obj.position.set(snap.position[0], snap.position[1], snap.position[2]);
   obj.rotation.set(snap.rotation[0], snap.rotation[1], snap.rotation[2]);
   obj.scale.set(snap.scale[0], snap.scale[1], snap.scale[2]);
+  enforceUniformScale(obj);
   setPlacedDimensions(obj, snap.dims);
   clampPlacedAboveFloor(obj);
 }
@@ -934,6 +992,8 @@ function syncSelectionFields() {
 }
 
 function inferEditorType(objDef) {
+  const isConfig = objDef?.modelType === 'Config' || String(objDef?.objectName || '').startsWith('StaticObj_');
+  if (isConfig) return String(objDef?.objectName || 'UnknownObject');
   return inferEditorModel(objDef);
 }
 
@@ -943,7 +1003,14 @@ function inferEditorModel(objDef) {
     .replace(/^\/+|\/+$/g, '');
   const modelName = String(objDef.objectName || 'unknown_object');
   const baseName = modelName.replace(/^.*[\\/]/, '');
-  const fileName = baseName.endsWith('.p3d') ? baseName : `${baseName}.p3d`;
+
+  // Config objects often expose class names in objectName; recover p3d filename from image path when available.
+  const imagePath = String(objDef.image || objDef.imageUrl || '');
+  const imageMatch = imagePath.match(/([^/\\]+\.p3d)\.jpg$/i);
+  const imageModelName = imageMatch ? imageMatch[1] : null;
+
+  const fileName = imageModelName
+    || (baseName.endsWith('.p3d') ? baseName : `${baseName}.p3d`);
   const full = path ? `${path}/${fileName}` : fileName;
   return full.replace(/\//g, '\\');
 }
@@ -1086,6 +1153,7 @@ function importSceneJson(text) {
     if (Array.isArray(item.rotationEuler) && item.rotationEuler.length === 3) {
       placed.rotation.set(item.rotationEuler[0], item.rotationEuler[1], item.rotationEuler[2]);
     }
+    enforceUniformScale(placed);
     clampPlacedAboveFloor(placed);
     scene.add(placed);
     state.placedObjects.push(placed);
@@ -1119,6 +1187,7 @@ function importDayzEditorJson(text) {
     const def = existing || {
       objectName: typeName,
       category: 'Imported',
+      modelType: null,
       path: '-',
       dimensionsVisual: [2.5, 2.5, 2.5],
       bboxMinVisual: null,
@@ -1133,6 +1202,7 @@ function importDayzEditorJson(text) {
       const [rx, ry, rz] = fromDayzOrientation(item.Orientation);
       placed.rotation.set(rx, ry, rz);
     }
+    enforceUniformScale(placed);
     clampPlacedAboveFloor(placed);
     scene.add(placed);
     state.placedObjects.push(placed);
@@ -1219,6 +1289,20 @@ document.querySelectorAll('[data-mode]').forEach((button) => {
 
 ui.search.addEventListener('input', filterCatalog);
 
+if (ui.moveSpeed) {
+  ui.moveSpeed.addEventListener('input', () => {
+    state.moveSpeed = Number(ui.moveSpeed.value) || 12;
+    if (ui.moveSpeedValue) ui.moveSpeedValue.textContent = `${state.moveSpeed}`;
+  });
+}
+
+if (ui.sprintMultiplier) {
+  ui.sprintMultiplier.addEventListener('input', () => {
+    state.sprintMultiplier = Number(ui.sprintMultiplier.value) || 2.2;
+    if (ui.sprintMultiplierValue) ui.sprintMultiplierValue.textContent = `${state.sprintMultiplier.toFixed(1)}x`;
+  });
+}
+
 ui.exportScene.addEventListener('click', downloadDayzEditorJson);
 ui.copyExport.addEventListener('click', copyDayzExportToClipboard);
 ui.undoAction.addEventListener('click', undoLastAction);
@@ -1246,6 +1330,7 @@ ui.duplicateSelected.addEventListener('click', () => {
   duplicate.position.copy(src.position).add(new THREE.Vector3(0.7, 0, 0.7));
   duplicate.rotation.copy(src.rotation);
   duplicate.scale.copy(src.scale);
+  enforceUniformScale(duplicate);
   clampPlacedAboveFloor(duplicate);
   scene.add(duplicate);
   state.placedObjects.push(duplicate);
@@ -1320,6 +1405,8 @@ window.addEventListener('beforeunload', () => {
 ui.canvas.addEventListener('mouseleave', () => {
   state.lookLastX = null;
   state.lookLastY = null;
+  state.lookEdgeSpinX = 0;
+  state.lookEdgeSpinY = 0;
 });
 
 window.addEventListener('mousemove', (event) => {
@@ -1338,6 +1425,24 @@ window.addEventListener('mousemove', (event) => {
   state.lookPitch -= deltaY * sensitivity;
   state.lookPitch = THREE.MathUtils.clamp(state.lookPitch, -Math.PI / 2 + 0.01, Math.PI / 2 - 0.01);
   updateCameraFromLookAngles();
+
+  const edgePx = 2;
+  const atLeft = event.clientX <= edgePx;
+  const atRight = event.clientX >= window.innerWidth - edgePx;
+  const atTop = event.clientY <= edgePx;
+  const atBottom = event.clientY >= window.innerHeight - edgePx;
+
+  if (atLeft || atRight) {
+    state.lookEdgeSpinX = THREE.MathUtils.clamp(deltaX * sensitivity * 24, -2.2, 2.2);
+  } else {
+    state.lookEdgeSpinX = 0;
+  }
+
+  if (atTop || atBottom) {
+    state.lookEdgeSpinY = THREE.MathUtils.clamp(deltaY * sensitivity * 24, -1.8, 1.8);
+  } else {
+    state.lookEdgeSpinY = 0;
+  }
 });
 
 async function loadCatalog() {
@@ -1384,6 +1489,7 @@ function animate() {
   pulseLight.position.z = Math.sin(t * 0.33) * 18;
   pulseLight.position.y = 7 + Math.sin(t * 1.8) * 0.9;
   applyKeyboardNavigation(delta);
+  applyEdgeCameraSpin(delta);
   updatePlaceEdgeEffects(delta);
   updatePlaceImpactEffects(delta);
   renderer.render(scene, camera);

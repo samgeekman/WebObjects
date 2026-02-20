@@ -37,10 +37,10 @@
         <div class="right-bottom">
           <h3>Export</h3>
           <div class="row export-actions">
-            <button id="exportScene" class="export-action">Export to File</button>
-            <button id="copyExport" class="export-action">Copy to Clipboard</button>
+            <button id="exportScene" class="export-action"><span class="btn-icon">📁</span><span>Export to File</span></button>
+            <button id="copyExport" class="export-action"><span class="btn-icon">📋</span><span>Copy to Clipboard</span></button>
             <label class="file-input import-large export-action">
-              Import
+              <span class="btn-icon">📥</span><span>Import</span>
               <input id="importScene" type="file" accept="application/json" />
             </label>
           </div>
@@ -52,11 +52,21 @@
     </div>
     <footer id="bottomToolbar">
       <div class="toolbar-left">
-        <button data-mode="translate">Move</button>
-        <button data-mode="rotate">Rotate</button>
-        <button id="deleteSelected">Delete</button>
-        <button id="duplicateSelected">Duplicate</button>
-        <button id="undoAction">Undo</button>
+        <button data-mode="translate"><span class="btn-icon">✥</span><span>Move</span></button>
+        <button data-mode="rotate"><span class="btn-icon">⟳</span><span>Rotate</span></button>
+        <button id="deleteSelected"><span class="btn-icon">🗑</span><span>Delete</span></button>
+        <button id="duplicateSelected"><span class="btn-icon">⧉</span><span>Duplicate</span></button>
+        <button id="undoAction"><span class="btn-icon">↶</span><span>Undo</span></button>
+        <label class="speed-control">
+          Speed
+          <input id="moveSpeed" type="range" min="2" max="40" step="1" value="12" />
+          <span id="moveSpeedValue">12</span>
+        </label>
+        <label class="speed-control">
+          Shift Boost
+          <input id="sprintMultiplier" type="range" min="1" max="4" step="0.1" value="2.2" />
+          <span id="sprintMultiplierValue">2.2x</span>
+        </label>
       </div>
       <div id="statusText" class="muted toolbar-status">Ready.</div>
     </footer>

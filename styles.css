@@ -24,7 +24,7 @@ body {
 
 #app {
   width: 100%;
-  height: calc(100% - 96px);
+  height: calc(100% - 72px);
   display: grid;
   grid-template-columns: 280px 1fr 320px;
 }
@@ -82,6 +82,9 @@ button {
 
 button {
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 button:hover {
@@ -235,6 +238,13 @@ button:hover {
   text-align: center;
 }
 
+.btn-icon {
+  display: inline-flex;
+  width: 1.1em;
+  justify-content: center;
+  line-height: 1;
+}
+
 #viewportWrap {
   position: relative;
 }
@@ -268,7 +278,7 @@ button:hover {
 }
 
 #bottomToolbar {
-  min-height: 96px;
+  min-height: 72px;
   border-top: 1px solid var(--line);
   background: linear-gradient(180deg, #141b26, #121821);
   display: grid;
@@ -288,6 +298,37 @@ button:hover {
   gap: 8px;
   align-items: center;
   flex-wrap: wrap;
+}
+
+.toolbar-left > button {
+  align-self: stretch;
+  min-height: 100%;
+}
+
+.speed-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 3px 7px;
+  background: #0d1520;
+  white-space: nowrap;
+  line-height: 1;
+}
+
+.speed-control input[type='range'] {
+  width: 82px;
+  margin: 0;
+}
+
+.speed-control span {
+  min-width: 28px;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
 .import-large {
