@@ -43,6 +43,7 @@ const ui = {
   deleteSelected: document.getElementById('deleteSelected'),
   duplicateSelected: document.getElementById('duplicateSelected'),
   openProcedural: document.getElementById('openProcedural'),
+  randomiseGarden: document.getElementById('randomiseGarden'),
   proceduralOverlay: document.getElementById('proceduralOverlay'),
   closeProcedural: document.getElementById('closeProcedural'),
   proceduralGrid: document.getElementById('proceduralGrid'),
@@ -244,6 +245,7 @@ const textureLoader = new THREE.TextureLoader();
 textureLoader.setCrossOrigin('anonymous');
 const objectTextureCache = new Map();
 const pendingTextureMaterials = new Map();
+let noImagePlaceholderTexture = null;
 
 async function loadHeightmapTerrain() {
   return new Promise((resolve, reject) => {
@@ -366,7 +368,11 @@ function createGrassTexture() {
 
 function applyObjectImageTexture(material, objDef) {
   const imageUrl = getObjectImageUrl(objDef);
-  if (!imageUrl) return;
+  if (!imageUrl) {
+    material.map = getNoImagePlaceholderTexture();
+    material.needsUpdate = true;
+    return;
+  }
 
   if (objectTextureCache.has(imageUrl)) {
     const cached = objectTextureCache.get(imageUrl);
@@ -402,8 +408,55 @@ function applyObjectImageTexture(material, objDef) {
     () => {
       objectTextureCache.delete(imageUrl);
       pendingTextureMaterials.delete(imageUrl);
+      material.map = getNoImagePlaceholderTexture();
+      material.needsUpdate = true;
     },
   );
+}
+
+function getNoImagePlaceholderTexture() {
+  if (noImagePlaceholderTexture) return noImagePlaceholderTexture;
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+
+  ctx.fillStyle = '#243244';
+  ctx.fillRect(0, 0, size, size);
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+  for (let i = 0; i <= size; i += 32) {
+    ctx.beginPath();
+    ctx.moveTo(i, 0);
+    ctx.lineTo(i, size);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(0, i);
+    ctx.lineTo(size, i);
+    ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.translate(size / 2, size / 2);
+  ctx.rotate(-Math.PI / 8);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 22px Arial';
+  ctx.fillStyle = 'rgba(255,255,255,0.82)';
+  ctx.fillText('No image... yet', 0, -16);
+  ctx.font = '16px Arial';
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.fillText('No image... yet', 0, 18);
+  ctx.restore();
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+  noImagePlaceholderTexture = tex;
+  return noImagePlaceholderTexture;
 }
 
 function onResize() {
@@ -461,6 +514,13 @@ function isGardenBuildingObject(obj) {
 
 function objectNameLower(obj) {
   return String(obj?.objectName || '').trim().toLowerCase();
+}
+
+function pickUniqueFromPool(pool, usedNames) {
+  const unique = pool.filter((o) => !usedNames.has(objectNameLower(o)));
+  const picked = randomOf(unique.length ? unique : pool);
+  if (picked) usedNames.add(objectNameLower(picked));
+  return picked || null;
 }
 
 function collectCatalogCandidates(keywordSets, predicate = null) {
@@ -523,12 +583,28 @@ function buildProceduralResolvedSet() {
     const n = objectNameLower(o);
     return n.includes('fagussylvatica') || n.includes('betulapendula');
   }).slice(0, 120);
-  const gardenPrimary = collectCatalogCandidates([['greenhouse'], ['glasshouse'], ['shed']], isGardenBuildingObject);
-  const gardenFallback = collectCatalogCandidates([['shed'], ['greenhouse']], null);
-  const gardenBuilding = randomOf((gardenPrimary.length ? gardenPrimary : gardenFallback).slice(0, 50));
+  const shedPool = state.catalog.filter((o) => {
+    const n = objectNameLower(o);
+    return /^land_shed_w[1-6]$/.test(n);
+  });
+
+  const benchPool = state.catalog.filter((o) => {
+    const n = objectNameLower(o);
+    return /^staticobj_misc_bench[1-5]$/.test(n);
+  });
+  const binPool = state.catalog.filter((o) => objectNameLower(o) === 'staticobj_garbage_bin');
+  const garbagePilePool = state.catalog.filter((o) => {
+    const n = objectNameLower(o);
+    return /^staticobj_garbage_pile[1-8]$/.test(n);
+  });
+  const bushPool = state.catalog.filter((o) => {
+    const n = objectNameLower(o);
+    return n.includes('corylusheterophylla') || n.includes('rosacanina');
+  });
 
   const blocks = [];
   const blockDefs = [];
+  const usedNames = new Set();
   const half = randomOf([16, 18, 20]);
   const gateSide = randomOf(['south', 'east', 'west', 'north']);
 
@@ -540,43 +616,48 @@ function buildProceduralResolvedSet() {
     scale: randomOf([0.95, 1, 1.05]),
   });
   blockDefs.push(house || null);
+  if (house) usedNames.add(objectNameLower(house));
 
   const fenceLen = (() => {
     if (!fence || !Array.isArray(fence.dimensionsVisual)) return 5;
     const d = fence.dimensionsVisual.map((v) => Math.abs(Number(v) || 0));
     return Math.max(4.5, Math.min(5.5, Math.max(d[0] || 5, d[2] || 5)));
   })();
-  const gateWidth = fenceLen * 1.05;
-  const start = -half + fenceLen / 2;
-  const end = half - fenceLen / 2;
+  const cornerJitter = 1.2;
+  const corners = {
+    nw: { x: -half + (Math.random() * 2 - 1) * cornerJitter, z: -half + (Math.random() * 2 - 1) * cornerJitter },
+    ne: { x: half + (Math.random() * 2 - 1) * cornerJitter, z: -half + (Math.random() * 2 - 1) * cornerJitter },
+    se: { x: half + (Math.random() * 2 - 1) * cornerJitter, z: half + (Math.random() * 2 - 1) * cornerJitter },
+    sw: { x: -half + (Math.random() * 2 - 1) * cornerJitter, z: half + (Math.random() * 2 - 1) * cornerJitter },
+  };
 
-  const pushFenceRun = (side) => {
-    for (let pos = start; pos <= end + 0.001; pos += fenceLen) {
-      if (Math.abs(pos) < gateWidth / 2 && side === gateSide) continue;
-      if (side === 'north' || side === 'south') {
-        blocks.push({
-          role: 'fence',
-          x: pos,
-          z: side === 'north' ? -half : half,
-          rot: 0,
-          scale: 1.0,
-        });
-      } else {
-        blocks.push({
-          role: 'fence',
-          x: side === 'west' ? -half : half,
-          z: pos,
-          rot: 90,
-          scale: 1.0,
-        });
-      }
+  const pushFenceEdge = (edgeName, a, b) => {
+    const dx = b.x - a.x;
+    const dz = b.z - a.z;
+    const edgeLen = Math.hypot(dx, dz);
+    if (edgeLen < 0.001) return;
+    // Use ceil so segments slightly overlap rather than leaving visible gaps.
+    const count = Math.max(1, Math.ceil(edgeLen / fenceLen));
+    // Fence model at yaw=0 runs along +X, so align yaw from X-axis to edge vector.
+    const yaw = THREE.MathUtils.radToDeg(Math.atan2(dz, dx));
+    const gateIndex = Math.floor(count / 2);
+    for (let i = 0; i < count; i += 1) {
+      if (edgeName === gateSide && i === gateIndex) continue;
+      const t = (i + 0.5) / count;
+      blocks.push({
+        role: 'fence',
+        x: a.x + dx * t,
+        z: a.z + dz * t,
+        rot: yaw,
+        scale: 1.0,
+      });
       blockDefs.push(fence || null);
     }
   };
-  pushFenceRun('north');
-  pushFenceRun('south');
-  pushFenceRun('west');
-  pushFenceRun('east');
+  pushFenceEdge('north', corners.nw, corners.ne);
+  pushFenceEdge('east', corners.ne, corners.se);
+  pushFenceEdge('south', corners.se, corners.sw);
+  pushFenceEdge('west', corners.sw, corners.nw);
 
   const treeSpots = [
     { x: -half + 4, z: -half + 4 },
@@ -592,6 +673,7 @@ function buildProceduralResolvedSet() {
     const treeDef = randomOf(treePool.filter((t) => !usedTreeNames.has(String(t.objectName || '').toLowerCase())))
       || randomOf(treePool);
     if (treeDef) usedTreeNames.add(String(treeDef.objectName || '').toLowerCase());
+    if (treeDef) usedNames.add(objectNameLower(treeDef));
     blocks.push({
       role: 'tree',
       x: spot.x + randomOf([-1, 0, 1]),
@@ -609,7 +691,8 @@ function buildProceduralResolvedSet() {
     { x: half - 6, z: -half + 7, rot: 0 },
   ];
   const shedPos = randomOf(outbuildingSpots);
-  if (shedPos) {
+  const shedDef = pickUniqueFromPool(shedPool, usedNames);
+  if (shedPos && shedDef) {
     blocks.push({
       role: 'garden',
       x: shedPos.x,
@@ -617,7 +700,42 @@ function buildProceduralResolvedSet() {
       rot: shedPos.rot,
       scale: randomOf([0.9, 1.0, 1.1]),
     });
-    blockDefs.push(gardenBuilding || null);
+    blockDefs.push(shedDef);
+  }
+
+  const decoSpots = [
+    { x: -half + 5, z: 0, rot: 90 },
+    { x: half - 5, z: 0, rot: -90 },
+    { x: 0, z: -half + 5, rot: 0 },
+    { x: 0, z: half - 5, rot: 180 },
+    { x: -half + 7, z: half - 5, rot: 160 },
+    { x: half - 7, z: half - 5, rot: -160 },
+  ].sort(() => Math.random() - 0.5);
+
+  const maybeAddDeco = (pool, chance, role, scaleRange = [1, 1]) => {
+    if (!pool.length) return;
+    if (Math.random() > chance) return;
+    const spot = decoSpots.pop();
+    if (!spot) return;
+    const def = pickUniqueFromPool(pool, usedNames);
+    if (!def) return;
+    blocks.push({
+      role,
+      x: spot.x + randomOf([-0.35, 0, 0.35]),
+      z: spot.z + randomOf([-0.35, 0, 0.35]),
+      rot: spot.rot + randomOf([-8, -4, 0, 4, 8]),
+      scale: randomOf(scaleRange),
+    });
+    blockDefs.push(def);
+  };
+
+  // Optional lot dressing: not every layout includes every type.
+  maybeAddDeco(benchPool, 0.8, 'deco', [0.95, 1.0, 1.05]);
+  maybeAddDeco(binPool, 0.7, 'deco', [0.9, 1.0, 1.05]);
+  maybeAddDeco(garbagePilePool, 0.6, 'deco', [0.9, 1.0]);
+  const bushCount = randomOf([0, 1, 1, 2, 2, 3]);
+  for (let i = 0; i < bushCount; i += 1) {
+    maybeAddDeco(bushPool, 1.0, 'bush', [0.9, 1.0, 1.1]);
   }
 
   return [{
@@ -627,6 +745,16 @@ function buildProceduralResolvedSet() {
     blockDefs,
     jitter: 0.15,
   }];
+}
+
+function quickRandomiseHouseGarden(confirmReplace = false) {
+  const templates = buildProceduralResolvedSet();
+  const template = templates[0];
+  if (!template) {
+    setStatus('Randomise failed: missing required objects.');
+    return;
+  }
+  applyProceduralTemplate(template, { confirmReplace });
 }
 
 function blockDimensions(block, template, blockIndex = -1) {
@@ -1908,10 +2036,11 @@ function groundHeightAt(x, z) {
   return FLOOR_Y;
 }
 
-function applyProceduralTemplate(template) {
+function applyProceduralTemplate(template, options = {}) {
+  const { confirmReplace = true } = options;
   if (!template) return;
   const previous = serializePlacedObjects();
-  if (state.placedObjects.length > 0) {
+  if (confirmReplace && state.placedObjects.length > 0) {
     const ok = window.confirm('Replace current placed objects with this procedural layout?');
     if (!ok) return;
   }
@@ -1930,7 +2059,17 @@ function applyProceduralTemplate(template) {
     if (roleLower === 'fence') r *= 0.36;
     if (roleLower === 'tree') r *= 0.5;
     if (roleLower === 'garden') r *= 0.75;
-    const minR = roleLower === 'fence' ? 0.8 : roleLower === 'tree' ? 1.0 : 1.8;
+    if (roleLower === 'bush') r *= 0.45;
+    if (roleLower === 'deco') r *= 0.5;
+    const minR = roleLower === 'fence'
+      ? 0.8
+      : roleLower === 'tree'
+        ? 1.0
+        : roleLower === 'bush'
+          ? 0.55
+          : roleLower === 'deco'
+            ? 0.7
+            : 1.8;
     return Math.max(minR, r);
   };
 
@@ -1973,11 +2112,14 @@ function applyProceduralTemplate(template) {
     const targetZ = baseZ + block.z + jz;
     const s = Number(block.scale || 1);
     const radius = radiusForDef(def, s, block.role);
-    const clear = findClearPlacement(targetX, targetZ, radius);
+    const clear = block.role === 'fence'
+      ? { x: targetX, z: targetZ }
+      : findClearPlacement(targetX, targetZ, radius);
     const x = clear.x;
     const z = clear.z;
     const y = groundHeightAt(x, z);
-    const yaw = Number(block.rot || 0) + (Math.random() * 10 - 5);
+    const yawBase = Number(block.rot || 0);
+    const yaw = block.role === 'fence' ? yawBase : yawBase + (Math.random() * 10 - 5);
 
     const placed = buildBoxMesh(def);
     placed.position.set(Math.round(x * 4) / 4, Math.round(y * 4) / 4, Math.round(z * 4) / 4);
@@ -2418,6 +2560,11 @@ ui.undoAction.addEventListener('click', undoLastAction);
 if (ui.openProcedural) {
   ui.openProcedural.addEventListener('click', () => {
     openProceduralOverlay();
+  });
+}
+if (ui.randomiseGarden) {
+  ui.randomiseGarden.addEventListener('click', () => {
+    quickRandomiseHouseGarden(false);
   });
 }
 if (ui.closeProcedural) {
