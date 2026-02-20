@@ -7,8 +7,19 @@ const catalogSources = [
   'https://samsobjectfinder.com/static/api/v1/objects.full.json',
   './public/data/objects.min.json',
 ];
+const MAPGROUP_PROTO_SOURCE = './public/data/mapgroupproto-merged.js';
+const MAPGROUP_LINK_SOURCE = './public/data/mapgroup-object-links.js';
 const FLOOR_Y = 0;
 const LAYOUT_STORAGE_KEY = 'sams_dayz_layout_tool_v1';
+const TERRAIN_IMAGE_URL = './heightmap_preview.png';
+const TERRAIN_WORLD_SIZE = 15360;
+const TERRAIN_MAX_HEIGHT = 550;
+const TERRAIN_SEGMENTS = 256;
+const HOUSE_GARDEN_PRESET = {
+  id: 'house_with_garden',
+  name: 'House with garden',
+  description: 'Simple square lot: house, fence, trees, and shed/greenhouse with randomized variants.',
+};
 
 const ui = {
   canvas: document.getElementById('viewport'),
@@ -16,22 +27,32 @@ const ui = {
   list: document.getElementById('objectList'),
   placedList: document.getElementById('placedList'),
   search: document.getElementById('searchInput'),
+  folderFilter: document.getElementById('folderFilter'),
   statusText: document.getElementById('statusText'),
   moveSpeed: document.getElementById('moveSpeed'),
   moveSpeedValue: document.getElementById('moveSpeedValue'),
   sprintMultiplier: document.getElementById('sprintMultiplier'),
   sprintMultiplierValue: document.getElementById('sprintMultiplierValue'),
+  terrainMode: document.getElementById('terrainMode'),
+  terrainHeightScale: document.getElementById('terrainHeightScale'),
+  terrainHeightScaleValue: document.getElementById('terrainHeightScaleValue'),
   exportScene: document.getElementById('exportScene'),
   copyExport: document.getElementById('copyExport'),
   undoAction: document.getElementById('undoAction'),
   importScene: document.getElementById('importScene'),
   deleteSelected: document.getElementById('deleteSelected'),
   duplicateSelected: document.getElementById('duplicateSelected'),
+  openProcedural: document.getElementById('openProcedural'),
+  proceduralOverlay: document.getElementById('proceduralOverlay'),
+  closeProcedural: document.getElementById('closeProcedural'),
+  proceduralGrid: document.getElementById('proceduralGrid'),
 };
 
 const state = {
   catalog: [],
   filtered: [],
+  folderPaths: [],
+  selectedFolder: '',
   selectedCatalog: null,
   selectedPlaced: null,
   placedObjects: [],
@@ -63,6 +84,19 @@ const state = {
   persistTimer: null,
   moveSpeed: 12,
   sprintMultiplier: 2.2,
+  terrainMesh: null,
+  terrainWire: null,
+  terrainMode: 'flat',
+  terrainLoadPromise: null,
+  terrainHeightScale: 1,
+  mapgroupLoadPromise: null,
+  mapgroupTemplates: new Map(),
+  mapgroupTemplateByObjectId: new Map(),
+  activeNodeEditorInstanceId: null,
+  selectedNodeMarker: null,
+  selectedNodeHolder: null,
+  selectedNodeIndex: -1,
+  proceduralTemplatesResolved: [],
 };
 
 const renderer = new THREE.WebGLRenderer({ canvas: ui.canvas, antialias: true });
@@ -84,11 +118,27 @@ orbit.update();
 
 const transform = new TransformControls(camera, renderer.domElement);
 let transformStartSnapshot = null;
+let nodeTransformStartSnapshot = null;
 transform.addEventListener('dragging-changed', (event) => {
   state.isTransformDragging = event.value;
   updateOrbitEnabled();
 });
 transform.addEventListener('objectChange', () => {
+  if (
+    state.selectedNodeMarker
+    && state.selectedNodeHolder
+    && state.selectedNodeIndex >= 0
+    && state.selectedNodeHolder.userData.nodeEditorActive
+  ) {
+    const nodes = cloneMapgroupNodes(state.selectedNodeHolder.userData.mapgroupNodes);
+    if (nodes[state.selectedNodeIndex]) {
+      const p = state.selectedNodeMarker.position;
+      nodes[state.selectedNodeIndex].pos = [p.x, p.y, p.z];
+      state.selectedNodeHolder.userData.mapgroupNodes = nodes;
+      schedulePersistPlacedObjects();
+    }
+    return;
+  }
   if (state.selectedPlaced) {
     enforceUniformScale(state.selectedPlaced);
     clampPlacedAboveFloor(state.selectedPlaced);
@@ -96,11 +146,40 @@ transform.addEventListener('objectChange', () => {
   syncSelectionFields();
 });
 transform.addEventListener('mouseDown', () => {
+  if (
+    state.selectedNodeHolder
+    && state.selectedNodeHolder.userData.nodeEditorActive
+    && state.selectedNodeIndex >= 0
+  ) {
+    nodeTransformStartSnapshot = cloneMapgroupNodes(state.selectedNodeHolder.userData.mapgroupNodes);
+    return;
+  }
   if (state.selectedPlaced) {
     transformStartSnapshot = snapshotPlaced(state.selectedPlaced);
   }
 });
 transform.addEventListener('mouseUp', () => {
+  if (
+    nodeTransformStartSnapshot
+    && state.selectedNodeHolder
+    && state.selectedNodeHolder.userData.nodeEditorActive
+    && state.selectedNodeIndex >= 0
+  ) {
+    const holder = state.selectedNodeHolder;
+    const before = nodeTransformStartSnapshot;
+    const after = cloneMapgroupNodes(holder.userData.mapgroupNodes);
+    const changed = JSON.stringify(before) !== JSON.stringify(after);
+    if (changed) {
+      pushUndo(() => {
+        holder.userData.mapgroupNodes = cloneMapgroupNodes(before);
+        rebuildPlacedNodeMarkers(holder);
+        selectNodeMarker(holder, Math.min(state.selectedNodeIndex, holder.userData.mapgroupNodes.length - 1));
+        renderPlacedList();
+      });
+    }
+    nodeTransformStartSnapshot = null;
+    return;
+  }
   if (!state.selectedPlaced || !transformStartSnapshot) return;
   const before = transformStartSnapshot;
   const after = snapshotPlaced(state.selectedPlaced);
@@ -164,6 +243,88 @@ const clock = new THREE.Clock();
 const textureLoader = new THREE.TextureLoader();
 textureLoader.setCrossOrigin('anonymous');
 const objectTextureCache = new Map();
+const pendingTextureMaterials = new Map();
+
+async function loadHeightmapTerrain() {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, img.width, img.height);
+        const terrain = buildTerrainFromHeightData(imageData.data, img.width, img.height);
+        resolve(terrain);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    img.onerror = () => reject(new Error('Failed to load heightmap image'));
+    img.src = TERRAIN_IMAGE_URL;
+  });
+}
+
+function buildTerrainFromHeightData(pixels, width, height) {
+  const geometry = new THREE.PlaneGeometry(
+    TERRAIN_WORLD_SIZE,
+    TERRAIN_WORLD_SIZE,
+    TERRAIN_SEGMENTS,
+    TERRAIN_SEGMENTS,
+  );
+  const pos = geometry.attributes.position;
+
+  for (let i = 0; i < pos.count; i += 1) {
+    const x = pos.getX(i);
+    const y = pos.getY(i);
+    const u = THREE.MathUtils.clamp((x / TERRAIN_WORLD_SIZE) + 0.5, 0, 1);
+    const v = THREE.MathUtils.clamp((y / TERRAIN_WORLD_SIZE) + 0.5, 0, 1);
+    const px = Math.min(width - 1, Math.max(0, Math.round(u * (width - 1))));
+    const py = Math.min(height - 1, Math.max(0, Math.round((1 - v) * (height - 1))));
+    const idx = (py * width + px) * 4;
+    const h01 = pixels[idx] / 255;
+    pos.setZ(i, h01 * TERRAIN_MAX_HEIGHT);
+  }
+  pos.needsUpdate = true;
+  geometry.computeVertexNormals();
+
+  const material = new THREE.MeshStandardMaterial({
+    color: 0x7f9a74,
+    roughness: 0.92,
+    metalness: 0.03,
+    transparent: false,
+    side: THREE.DoubleSide,
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.rotation.x = -Math.PI / 2;
+  mesh.position.y = FLOOR_Y;
+  mesh.name = 'terrain';
+  mesh.receiveShadow = true;
+
+  const wire = new THREE.LineSegments(
+    new THREE.WireframeGeometry(geometry),
+    new THREE.LineBasicMaterial({
+      color: 0x5f788f,
+      transparent: true,
+      opacity: 0.3,
+    }),
+  );
+  wire.rotation.x = -Math.PI / 2;
+  wire.position.y = FLOOR_Y + 0.15;
+  wire.name = 'terrainWire';
+
+  return { mesh, wire };
+}
+
+function applyTerrainHeightScale() {
+  if (!state.terrainMesh) return;
+  const s = Number(state.terrainHeightScale) || 1;
+  state.terrainMesh.scale.z = s;
+  if (state.terrainWire) state.terrainWire.scale.z = s;
+}
 
 function createGrassTexture() {
   const size = 256;
@@ -212,11 +373,16 @@ function applyObjectImageTexture(material, objDef) {
     if (cached) {
       material.map = cached;
       material.needsUpdate = true;
+    } else {
+      const pending = pendingTextureMaterials.get(imageUrl) || [];
+      pending.push(material);
+      pendingTextureMaterials.set(imageUrl, pending);
     }
     return;
   }
 
   objectTextureCache.set(imageUrl, null);
+  pendingTextureMaterials.set(imageUrl, [material]);
   textureLoader.load(
     imageUrl,
     (tex) => {
@@ -225,12 +391,17 @@ function applyObjectImageTexture(material, objDef) {
       tex.colorSpace = THREE.SRGBColorSpace;
       tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
       objectTextureCache.set(imageUrl, tex);
-      material.map = tex;
-      material.needsUpdate = true;
+      const pending = pendingTextureMaterials.get(imageUrl) || [];
+      for (const mat of pending) {
+        mat.map = tex;
+        mat.needsUpdate = true;
+      }
+      pendingTextureMaterials.delete(imageUrl);
     },
     undefined,
     () => {
       objectTextureCache.delete(imageUrl);
+      pendingTextureMaterials.delete(imageUrl);
     },
   );
 }
@@ -252,6 +423,302 @@ function formatDim(dims) {
 
 function setStatus(message) {
   if (ui.statusText) ui.statusText.textContent = message;
+}
+
+function randomOf(list) {
+  if (!Array.isArray(list) || list.length === 0) return null;
+  return list[Math.floor(Math.random() * list.length)] || null;
+}
+
+function normalizeSearchText(obj) {
+  return `${obj.objectName || ''} ${obj.path || ''} ${obj.category || ''} ${obj.inGameName || ''}`.toLowerCase();
+}
+
+function isLandHouseObject(obj) {
+  const objectName = String(obj?.objectName || '');
+  const path = String(obj?.path || '').toLowerCase();
+  return objectName.startsWith('Land_House') || path.includes('/houses');
+}
+
+function isFenceObject(obj) {
+  const n = String(obj?.objectName || '').toLowerCase();
+  const p = String(obj?.path || '').toLowerCase();
+  return n.includes('fence') || n.includes('hbarrier') || p.includes('/fences');
+}
+
+function isTreeObject(obj) {
+  const n = String(obj?.objectName || '').toLowerCase();
+  const p = String(obj?.path || '').toLowerCase();
+  return n.includes('tree') || n.includes('apple') || n.includes('pear') || n.includes('plum') || p.includes('/trees');
+}
+
+function isGardenBuildingObject(obj) {
+  const n = String(obj?.objectName || '').toLowerCase();
+  const p = String(obj?.path || '').toLowerCase();
+  if (isLandHouseObject(obj)) return false;
+  return n.includes('greenhouse') || n.includes('glasshouse') || n.includes('shed') || p.includes('/sheds') || p.includes('/greenhouse');
+}
+
+function collectCatalogCandidates(keywordSets, predicate = null) {
+  if (!Array.isArray(keywordSets)) return [];
+  for (const set of keywordSets) {
+    const keywords = Array.isArray(set) ? set.map((k) => String(k || '').toLowerCase()).filter(Boolean) : [];
+    if (!keywords.length) continue;
+    const hits = state.catalog.filter((obj) => {
+      if (predicate && !predicate(obj)) return false;
+      const text = normalizeSearchText(obj);
+      return keywords.every((kw) => text.includes(kw));
+    });
+    if (hits.length) {
+      return hits.sort((a, b) => {
+        const scoreA = (a.hasKnownDimensions ? 2 : 0) + (a.imageUrl || a.image ? 1 : 0);
+        const scoreB = (b.hasKnownDimensions ? 2 : 0) + (b.imageUrl || b.image ? 1 : 0);
+        return scoreB - scoreA;
+      });
+    }
+  }
+  return [];
+}
+
+function resolveProceduralTemplate(spec) {
+  const roleDefs = {};
+  const roleCandidates = {};
+  for (const [role, keywordSets] of Object.entries(spec.roles || {})) {
+    const candidates = collectCatalogCandidates(keywordSets, isLandHouseObject);
+    roleCandidates[role] = candidates;
+    roleDefs[role] = candidates[0] || null;
+  }
+
+  const usedObjectNames = new Set();
+  const blockDefs = (spec.blocks || []).map((block) => {
+    const candidates = roleCandidates[block.role] || [];
+    const unique = candidates.filter((c) => !usedObjectNames.has(String(c.objectName || '').toLowerCase()));
+    const choicePool = unique.length ? unique : [];
+    const picked = randomOf(choicePool.slice(0, Math.min(24, choicePool.length))) || null;
+    if (picked) usedObjectNames.add(String(picked.objectName || '').toLowerCase());
+    return picked;
+  });
+
+  return {
+    ...spec,
+    roleDefs,
+    blockDefs,
+  };
+}
+
+function buildProceduralResolvedSet() {
+  const housePrimary = collectCatalogCandidates([['land_house_1w'], ['land_house_2w'], ['land_house']], isLandHouseObject);
+  const houseFallback = collectCatalogCandidates([['land_house']], null);
+  const house = randomOf((housePrimary.length ? housePrimary : houseFallback).slice(0, 40));
+
+  const fencePrimary = collectCatalogCandidates([['fence'], ['hbarrier'], ['wall_fence']], isFenceObject);
+  const fenceFallback = collectCatalogCandidates([['fence'], ['barrier']], null);
+  const fence = randomOf((fencePrimary.length ? fencePrimary : fenceFallback).slice(0, 40));
+
+  let treePool = collectCatalogCandidates([['tree'], ['apple'], ['plum'], ['pear']], isTreeObject).slice(0, 80);
+  if (!treePool.length) treePool = collectCatalogCandidates([['tree'], ['bush']], null).slice(0, 80);
+  const gardenPrimary = collectCatalogCandidates([['greenhouse'], ['glasshouse'], ['shed']], isGardenBuildingObject);
+  const gardenFallback = collectCatalogCandidates([['shed'], ['greenhouse']], null);
+  const gardenBuilding = randomOf((gardenPrimary.length ? gardenPrimary : gardenFallback).slice(0, 50));
+
+  const blocks = [];
+  const blockDefs = [];
+  const half = randomOf([16, 18, 20]);
+  const gateSide = randomOf(['south', 'east', 'west', 'north']);
+
+  blocks.push({
+    role: 'house',
+    x: randomOf([-1.5, 0, 1.5]),
+    z: randomOf([-1.5, 0, 1.5]),
+    rot: randomOf([0, 90, 180, -90]),
+    scale: randomOf([0.95, 1, 1.05]),
+  });
+  blockDefs.push(house || null);
+
+  const fenceSegments = [
+    { x: -half, z: -half, rot: 0 },
+    { x: 0, z: -half, rot: 0 },
+    { x: half, z: -half, rot: 0 },
+    { x: -half, z: half, rot: 0 },
+    { x: 0, z: half, rot: 0 },
+    { x: half, z: half, rot: 0 },
+    { x: -half, z: 0, rot: 90 },
+    { x: half, z: 0, rot: 90 },
+  ];
+
+  for (const seg of fenceSegments) {
+    if (
+      (gateSide === 'south' && seg.x === 0 && seg.z === half)
+      || (gateSide === 'north' && seg.x === 0 && seg.z === -half)
+      || (gateSide === 'west' && seg.x === -half && seg.z === 0)
+      || (gateSide === 'east' && seg.x === half && seg.z === 0)
+    ) {
+      continue;
+    }
+    blocks.push({
+      role: 'fence',
+      x: seg.x,
+      z: seg.z,
+      rot: seg.rot,
+      scale: randomOf([0.9, 1.0, 1.05]),
+    });
+    blockDefs.push(fence || null);
+  }
+
+  const treeSpots = [
+    { x: -half + 4, z: -half + 4 },
+    { x: half - 4, z: -half + 4 },
+    { x: -half + 4, z: half - 4 },
+    { x: half - 4, z: half - 4 },
+  ].sort(() => Math.random() - 0.5);
+  const treeCount = randomOf([2, 3]);
+  const usedTreeNames = new Set();
+  for (let i = 0; i < treeCount; i += 1) {
+    const spot = treeSpots[i];
+    if (!spot) continue;
+    const treeDef = randomOf(treePool.filter((t) => !usedTreeNames.has(String(t.objectName || '').toLowerCase())))
+      || randomOf(treePool);
+    if (treeDef) usedTreeNames.add(String(treeDef.objectName || '').toLowerCase());
+    blocks.push({
+      role: 'tree',
+      x: spot.x + randomOf([-1, 0, 1]),
+      z: spot.z + randomOf([-1, 0, 1]),
+      rot: randomOf([0, 45, 90, 135]),
+      scale: randomOf([0.9, 1.0, 1.1]),
+    });
+    blockDefs.push(treeDef || null);
+  }
+
+  const outbuildingSpots = [
+    { x: -half + 6, z: half - 7, rot: 180 },
+    { x: half - 6, z: half - 7, rot: 180 },
+    { x: -half + 6, z: -half + 7, rot: 0 },
+    { x: half - 6, z: -half + 7, rot: 0 },
+  ];
+  const shedPos = randomOf(outbuildingSpots);
+  if (shedPos) {
+    blocks.push({
+      role: 'garden',
+      x: shedPos.x,
+      z: shedPos.z,
+      rot: shedPos.rot,
+      scale: randomOf([0.9, 1.0, 1.1]),
+    });
+    blockDefs.push(gardenBuilding || null);
+  }
+
+  return [{
+    ...HOUSE_GARDEN_PRESET,
+    roles: {},
+    blocks,
+    blockDefs,
+    jitter: 0.15,
+  }];
+}
+
+function blockDimensions(block, template, blockIndex = -1) {
+  const idx = blockIndex >= 0 ? blockIndex : (template.blocks || []).indexOf(block);
+  const def = idx >= 0 ? template.blockDefs?.[idx] : null;
+  const dims = Array.isArray(def?.dimensionsVisual) ? def.dimensionsVisual : [5, 4, 5];
+  const scale = Number(block.scale) || 1;
+  return { w: Math.max(1.2, dims[0] * scale), d: Math.max(1.2, dims[2] * scale) };
+}
+
+function renderProceduralOverlay() {
+  if (!ui.proceduralGrid) return;
+  ui.proceduralGrid.innerHTML = '';
+  state.proceduralTemplatesResolved = buildProceduralResolvedSet();
+
+  for (const template of state.proceduralTemplatesResolved) {
+    const card = document.createElement('div');
+    card.className = 'procedural-card';
+
+    const title = document.createElement('h4');
+    title.textContent = template.name;
+    const desc = document.createElement('p');
+    desc.className = 'muted';
+    desc.textContent = template.description;
+
+    const preview = document.createElement('div');
+    preview.className = 'procedural-preview';
+
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    for (let i = 0; i < template.blocks.length; i += 1) {
+      const block = template.blocks[i];
+      const { w, d } = blockDimensions(block, template, i);
+      minX = Math.min(minX, block.x - w / 2);
+      maxX = Math.max(maxX, block.x + w / 2);
+      minZ = Math.min(minZ, block.z - d / 2);
+      maxZ = Math.max(maxZ, block.z + d / 2);
+    }
+    const spanX = Math.max(6, maxX - minX);
+    const spanZ = Math.max(6, maxZ - minZ);
+    const pad = 8;
+
+    for (let i = 0; i < template.blocks.length; i += 1) {
+      const block = template.blocks[i];
+      const { w, d } = blockDimensions(block, template, i);
+      const def = template.blockDefs?.[i] || null;
+      const imageUrl = def ? getObjectImageUrl(def) : '';
+      const leftPct = ((block.x - w / 2 - minX) / spanX) * (100 - pad * 2 / 1.5) + (pad / 1.5);
+      const topPct = ((block.z - d / 2 - minZ) / spanZ) * (100 - pad * 2 / 1.5) + (pad / 1.5);
+      const wPct = (w / spanX) * (100 - pad * 2 / 1.5);
+      const hPct = (d / spanZ) * (100 - pad * 2 / 1.5);
+
+      const node = document.createElement('div');
+      node.className = 'proc-block';
+      node.style.left = `${leftPct}%`;
+      node.style.top = `${topPct}%`;
+      node.style.width = `${Math.max(4, wPct)}%`;
+      node.style.height = `${Math.max(4, hPct)}%`;
+      node.style.transform = `rotate(${Number(block.rot) || 0}deg)`;
+      if (imageUrl) node.style.backgroundImage = `url("${imageUrl}")`;
+      node.title = def?.objectName || `${block.role} (unresolved)`;
+      preview.appendChild(node);
+    }
+
+    const unresolved = template.blocks.filter((_, idx) => !template.blockDefs?.[idx]).length;
+    const meta = document.createElement('div');
+    meta.className = 'procedural-meta';
+    const info = document.createElement('span');
+    info.className = 'muted';
+    info.textContent = unresolved > 0
+      ? `${template.blocks.length - unresolved}/${template.blocks.length} blocks resolved`
+      : `${template.blocks.length} blocks`;
+    const generate = document.createElement('button');
+    generate.className = 'procedural-generate';
+    generate.type = 'button';
+    generate.textContent = 'Generate';
+    generate.disabled = unresolved >= template.blocks.length;
+    generate.addEventListener('click', () => {
+      applyProceduralTemplate(template);
+      closeProceduralOverlay();
+    });
+    meta.appendChild(info);
+    meta.appendChild(generate);
+
+    card.appendChild(title);
+    card.appendChild(desc);
+    card.appendChild(preview);
+    card.appendChild(meta);
+    ui.proceduralGrid.appendChild(card);
+  }
+}
+
+function openProceduralOverlay() {
+  if (!ui.proceduralOverlay) return;
+  renderProceduralOverlay();
+  ui.proceduralOverlay.classList.add('open');
+  ui.proceduralOverlay.setAttribute('aria-hidden', 'false');
+}
+
+function closeProceduralOverlay() {
+  if (!ui.proceduralOverlay) return;
+  ui.proceduralOverlay.classList.remove('open');
+  ui.proceduralOverlay.setAttribute('aria-hidden', 'true');
 }
 
 function describeDimensionSource(objDef) {
@@ -304,7 +771,7 @@ function normalizeCatalogEntry(item) {
     inGameName: item?.inGameName || '-',
     category: item?.category || 'Uncategorized',
     modelType: item?.modelType || null,
-    path: item?.path || '',
+    path: String(item?.path || '').replace(/\\/g, '/'),
     imageUrl: item?.imageUrl || '',
     image: item?.image || '',
     bboxStatus: item?.bboxStatus || 'unknown',
@@ -314,6 +781,304 @@ function normalizeCatalogEntry(item) {
     bboxMaxVisual: Array.isArray(item?.bboxMaxVisual) ? item.bboxMaxVisual : null,
     hasKnownDimensions,
   };
+}
+
+function normalizeMapgroupKey(name) {
+  return String(name || '')
+    .replace(/\\/g, '/')
+    .replace(/^.*\//, '')
+    .replace(/\.p3d$/i, '')
+    .trim()
+    .toLowerCase();
+}
+
+function extractAssignedGlobal(sourceText, globalName) {
+  const needle = `window.${globalName}`;
+  const start = sourceText.indexOf(needle);
+  if (start < 0) return null;
+  const eq = sourceText.indexOf('=', start);
+  if (eq < 0) return null;
+  const semi = sourceText.lastIndexOf(';');
+  if (semi <= eq) return null;
+  return sourceText.slice(eq + 1, semi).trim();
+}
+
+function parseMapgroupXmlStringFromJs(text) {
+  const raw = extractAssignedGlobal(text, 'BUILTIN_MAPGROUPPROTO_XML');
+  if (!raw) return '';
+  try {
+    // Mapgroup file stores a quoted JS string, not raw XML.
+    return JSON.parse(raw);
+  } catch {
+    return '';
+  }
+}
+
+function parseMapgroupLinksFromJs(text) {
+  const raw = extractAssignedGlobal(text, 'MAPGROUP_OBJECT_LINK_DATA');
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function parseMapgroupTemplatesFromXml(xmlText) {
+  const templates = new Map();
+  if (!xmlText) return templates;
+  const doc = new DOMParser().parseFromString(xmlText, 'application/xml');
+  const groups = doc.querySelectorAll('group');
+  for (const groupEl of groups) {
+    const groupName = groupEl.getAttribute('name') || '';
+    const key = normalizeMapgroupKey(groupName);
+    if (!key) continue;
+    const points = [];
+    const containers = groupEl.querySelectorAll('container');
+    for (const containerEl of containers) {
+      const containerName = containerEl.getAttribute('name') || 'container';
+      const pointEls = containerEl.querySelectorAll('point');
+      for (const pointEl of pointEls) {
+        const posRaw = (pointEl.getAttribute('pos') || '').trim().split(/\s+/).map(Number);
+        if (posRaw.length !== 3 || posRaw.some((v) => !Number.isFinite(v))) continue;
+        points.push({
+          pos: [posRaw[0], posRaw[1], posRaw[2]],
+          range: Number(pointEl.getAttribute('range')) || 0.35,
+          height: Number(pointEl.getAttribute('height')) || 1,
+          flags: Number(pointEl.getAttribute('flags')) || 0,
+          container: containerName,
+        });
+      }
+    }
+    templates.set(key, { groupName, points });
+  }
+  return templates;
+}
+
+function cloneMapgroupNodes(nodes) {
+  return Array.isArray(nodes)
+    ? nodes.map((n) => ({
+      pos: Array.isArray(n?.pos) && n.pos.length === 3
+        ? [Number(n.pos[0]) || 0, Number(n.pos[1]) || 0, Number(n.pos[2]) || 0]
+        : [0, 0, 0],
+      range: Number(n?.range) || 0.35,
+      height: Number(n?.height) || 1,
+      flags: Number(n?.flags) || 0,
+      container: String(n?.container || 'custom'),
+    }))
+    : [];
+}
+
+function clearSelectedNodeMarker() {
+  state.selectedNodeMarker = null;
+  state.selectedNodeHolder = null;
+  state.selectedNodeIndex = -1;
+}
+
+function refreshTransformAttachment() {
+  if (
+    state.selectedNodeMarker
+    && state.selectedNodeHolder
+    && state.selectedNodeHolder.userData.nodeEditorActive
+    && state.selectedNodeIndex >= 0
+  ) {
+    transform.attach(state.selectedNodeMarker);
+    return;
+  }
+  if (state.selectedPlaced && !state.selectedPlaced.userData.nodeEditorActive) {
+    transform.attach(state.selectedPlaced);
+    return;
+  }
+  transform.detach();
+}
+
+function selectNodeMarker(holder, index) {
+  if (!holder || !holder.userData.nodeEditorActive) {
+    clearSelectedNodeMarker();
+    refreshTransformAttachment();
+    return;
+  }
+  const group = getNodeGroup(holder);
+  if (!group) {
+    clearSelectedNodeMarker();
+    refreshTransformAttachment();
+    return;
+  }
+  const marker = group.children.find((c) => Number(c.userData.nodeIndex) === Number(index));
+  if (!marker) {
+    clearSelectedNodeMarker();
+    refreshTransformAttachment();
+    return;
+  }
+  state.selectedNodeHolder = holder;
+  state.selectedNodeMarker = marker;
+  state.selectedNodeIndex = Number(index);
+  transform.setMode('translate');
+  setSelectedPlaced(holder);
+  refreshTransformAttachment();
+}
+
+function resolveMapgroupTemplateForDef(objDef) {
+  const objectId = String(objDef?.stableId || '').trim();
+  if (objectId && state.mapgroupTemplateByObjectId.has(objectId)) {
+    return state.mapgroupTemplateByObjectId.get(objectId);
+  }
+  const name = String(objDef?.objectName || '');
+  const key = normalizeMapgroupKey(name);
+  if (!key) return null;
+  return state.mapgroupTemplates.get(key) || null;
+}
+
+function getNodeGroup(holder) {
+  return holder.children.find((c) => c.name === 'mapgroupNodes') || null;
+}
+
+function rebuildPlacedNodeMarkers(holder) {
+  const nodeGroup = getNodeGroup(holder);
+  if (!nodeGroup) return;
+  while (nodeGroup.children.length > 0) {
+    const node = nodeGroup.children.pop();
+    node.geometry?.dispose?.();
+    node.material?.dispose?.();
+  }
+  const nodes = cloneMapgroupNodes(holder.userData.mapgroupNodes);
+  holder.userData.mapgroupNodes = nodes;
+  for (let i = 0; i < nodes.length; i += 1) {
+    const node = nodes[i];
+    const marker = new THREE.Mesh(
+      new THREE.SphereGeometry(0.1, 12, 12),
+      new THREE.MeshStandardMaterial({
+        color: 0xff9650,
+        emissive: 0xff5a00,
+        emissiveIntensity: 0.9,
+        roughness: 0.35,
+        metalness: 0.1,
+      }),
+    );
+    marker.name = `mapgroupNode-${i}`;
+    marker.userData.nodeIndex = i;
+    marker.userData.parentInstanceId = holder.userData.instanceId;
+    marker.position.set(node.pos[0], node.pos[1], node.pos[2]);
+    marker.castShadow = true;
+    marker.receiveShadow = true;
+    nodeGroup.add(marker);
+  }
+  if (state.selectedNodeHolder === holder) {
+    const maxIndex = holder.userData.mapgroupNodes.length - 1;
+    if (maxIndex < 0) {
+      clearSelectedNodeMarker();
+    } else {
+      const nextIndex = Math.min(state.selectedNodeIndex, maxIndex);
+      const nextMarker = nodeGroup.children.find((c) => Number(c.userData.nodeIndex) === Number(nextIndex));
+      if (nextMarker) {
+        state.selectedNodeMarker = nextMarker;
+        state.selectedNodeIndex = nextIndex;
+      } else {
+        clearSelectedNodeMarker();
+      }
+    }
+  }
+  refreshTransformAttachment();
+}
+
+function ensureMapgroupNodesFromTemplate(holder) {
+  const existing = holder.userData.mapgroupNodes;
+  if (Array.isArray(existing) && existing.length > 0) return true;
+  const template = resolveMapgroupTemplateForDef(holder.userData?.objectDef || {});
+  if (!template || !Array.isArray(template.points) || template.points.length === 0) return false;
+  holder.userData.mapgroupNodes = cloneMapgroupNodes(template.points);
+  rebuildPlacedNodeMarkers(holder);
+  return true;
+}
+
+function hasMapgroupTemplate(holder) {
+  return Boolean(resolveMapgroupTemplateForDef(holder.userData?.objectDef || {}));
+}
+
+function setNodeEditorActive(holder, active) {
+  if (!holder) return;
+  if (active) {
+    if (!ensureMapgroupNodesFromTemplate(holder)) return;
+    if (state.activeNodeEditorInstanceId && state.activeNodeEditorInstanceId !== holder.userData.instanceId) {
+      const other = state.placedObjects.find((p) => p.userData.instanceId === state.activeNodeEditorInstanceId);
+      if (other) {
+        other.userData.nodeEditorActive = false;
+        const otherGroup = getNodeGroup(other);
+        if (otherGroup) otherGroup.visible = false;
+        if (state.selectedNodeHolder === other) clearSelectedNodeMarker();
+      }
+    }
+    holder.userData.nodeEditorActive = true;
+    state.activeNodeEditorInstanceId = holder.userData.instanceId;
+    const nodeGroup = getNodeGroup(holder);
+    if (nodeGroup) nodeGroup.visible = true;
+    selectNodeMarker(holder, 0);
+  } else {
+    holder.userData.nodeEditorActive = false;
+    const nodeGroup = getNodeGroup(holder);
+    if (nodeGroup) nodeGroup.visible = false;
+    if (state.activeNodeEditorInstanceId === holder.userData.instanceId) {
+      state.activeNodeEditorInstanceId = null;
+    }
+    if (state.selectedNodeHolder === holder) clearSelectedNodeMarker();
+  }
+  refreshTransformAttachment();
+  updateSelectionOutlineStyles();
+  renderPlacedList();
+}
+
+async function loadMapgroupData() {
+  if (state.mapgroupLoadPromise) return state.mapgroupLoadPromise;
+  state.mapgroupLoadPromise = (async () => {
+    try {
+      const [protoRes, linkRes] = await Promise.all([
+        fetch(MAPGROUP_PROTO_SOURCE, { cache: 'no-cache' }),
+        fetch(MAPGROUP_LINK_SOURCE, { cache: 'no-cache' }),
+      ]);
+      if (!protoRes.ok || !linkRes.ok) throw new Error('mapgroup files unavailable');
+      const [protoText, linkText] = await Promise.all([protoRes.text(), linkRes.text()]);
+      const xml = parseMapgroupXmlStringFromJs(protoText);
+      const templates = parseMapgroupTemplatesFromXml(xml);
+      const linkData = parseMapgroupLinksFromJs(linkText);
+      const byObjectId = new Map();
+      if (linkData?.links && typeof linkData.links === 'object') {
+        for (const key of Object.keys(linkData.links)) {
+          const entry = linkData.links[key];
+          const id = String(entry?.id || '').trim();
+          const normalizedKey = normalizeMapgroupKey(key || entry?.objectName || '');
+          const template = templates.get(normalizedKey);
+          if (id && template) byObjectId.set(id, template);
+        }
+      }
+      state.mapgroupTemplates = templates;
+      state.mapgroupTemplateByObjectId = byObjectId;
+      renderPlacedList();
+      return true;
+    } catch (error) {
+      console.warn('Mapgroup data load failed:', error);
+      return false;
+    }
+  })();
+  return state.mapgroupLoadPromise;
+}
+
+function rebuildFolderFilter() {
+  if (!ui.folderFilter) return;
+  const current = state.selectedFolder || '';
+  ui.folderFilter.innerHTML = '';
+
+  const allOpt = document.createElement('option');
+  allOpt.value = '';
+  allOpt.textContent = 'All folders';
+  ui.folderFilter.appendChild(allOpt);
+
+  for (const p of state.folderPaths) {
+    const opt = document.createElement('option');
+    opt.value = p;
+    opt.textContent = p;
+    ui.folderFilter.appendChild(opt);
+  }
+  ui.folderFilter.value = state.folderPaths.includes(current) ? current : '';
 }
 
 function serializePlacedObjects() {
@@ -334,8 +1099,68 @@ function serializePlacedObjects() {
       position: [o.position.x, o.position.y, o.position.z],
       rotation: [o.rotation.x, o.rotation.y, o.rotation.z],
       scale: [o.scale.x, o.scale.y, o.scale.z],
+      mapgroupNodes: cloneMapgroupNodes(o.userData?.mapgroupNodes),
     };
   });
+}
+
+function createPlacedFromSerializedItem(item) {
+  const existing = state.catalog.find((x) => x.objectName === item.objectName);
+  const def = existing || {
+    objectName: item.objectName || 'unknown_object',
+    path: item.path || '',
+    category: item.category || 'Imported',
+    modelType: item.modelType || null,
+    imageUrl: item.imageUrl || '',
+    image: item.image || '',
+    bboxStatus: item.bboxStatus || 'unknown',
+    dimensionsSource: item.dimensionsSource || 'unknown',
+    dimensionsVisual: item.dimensionsVisual || [2.5, 2.5, 2.5],
+    bboxMinVisual: Array.isArray(item.bboxMinVisual) ? item.bboxMinVisual : null,
+    bboxMaxVisual: Array.isArray(item.bboxMaxVisual) ? item.bboxMaxVisual : null,
+    hasKnownDimensions: item.bboxStatus === 'matched',
+  };
+  const dims = Array.isArray(item.dimensionsVisual) ? item.dimensionsVisual : def.dimensionsVisual;
+  const placed = buildBoxMesh(def, dims);
+  if (Array.isArray(item.position) && item.position.length === 3) {
+    placed.position.set(Number(item.position[0]) || 0, Number(item.position[1]) || 0, Number(item.position[2]) || 0);
+  }
+  if (Array.isArray(item.rotation) && item.rotation.length === 3) {
+    placed.rotation.set(Number(item.rotation[0]) || 0, Number(item.rotation[1]) || 0, Number(item.rotation[2]) || 0);
+  }
+  if (Array.isArray(item.scale) && item.scale.length === 3) {
+    placed.scale.set(Number(item.scale[0]) || 1, Number(item.scale[1]) || 1, Number(item.scale[2]) || 1);
+  }
+  if (Array.isArray(item.mapgroupNodes)) {
+    placed.userData.mapgroupNodes = cloneMapgroupNodes(item.mapgroupNodes);
+    rebuildPlacedNodeMarkers(placed);
+  }
+  enforceUniformScale(placed);
+  clampPlacedAboveFloor(placed);
+  return placed;
+}
+
+function replacePlacedFromSerialized(data, resetUndo = false, persist = true) {
+  for (const obj of state.placedObjects) scene.remove(obj);
+  state.placedObjects = [];
+  state.activeNodeEditorInstanceId = null;
+  clearSelectedNodeMarker();
+  refreshTransformAttachment();
+  if (resetUndo) state.undoStack = [];
+
+  for (const item of data) {
+    const placed = createPlacedFromSerializedItem(item);
+    scene.add(placed);
+    state.placedObjects.push(placed);
+  }
+
+  if (state.placedObjects.length) {
+    setSelectedPlaced(state.placedObjects[0]);
+  } else {
+    setSelectedPlaced(null);
+  }
+  renderPlacedList();
+  if (persist) schedulePersistPlacedObjects();
 }
 
 function persistPlacedObjectsNow() {
@@ -372,47 +1197,7 @@ function restorePlacedObjectsFromStorage() {
   }
   if (!Array.isArray(data)) return 0;
 
-  clearPlaced(false);
-
-  for (const item of data) {
-    const existing = state.catalog.find((x) => x.objectName === item.objectName);
-    const def = existing || {
-      objectName: item.objectName || 'unknown_object',
-      path: item.path || '',
-      category: item.category || 'Imported',
-      modelType: item.modelType || null,
-      imageUrl: item.imageUrl || '',
-      image: item.image || '',
-      bboxStatus: item.bboxStatus || 'unknown',
-      dimensionsSource: item.dimensionsSource || 'unknown',
-      dimensionsVisual: item.dimensionsVisual || [2.5, 2.5, 2.5],
-      bboxMinVisual: Array.isArray(item.bboxMinVisual) ? item.bboxMinVisual : null,
-      bboxMaxVisual: Array.isArray(item.bboxMaxVisual) ? item.bboxMaxVisual : null,
-      hasKnownDimensions: item.bboxStatus === 'matched',
-    };
-    const dims = Array.isArray(item.dimensionsVisual) ? item.dimensionsVisual : def.dimensionsVisual;
-    const placed = buildBoxMesh(def, dims);
-    if (Array.isArray(item.position) && item.position.length === 3) {
-      placed.position.set(Number(item.position[0]) || 0, Number(item.position[1]) || 0, Number(item.position[2]) || 0);
-    }
-    if (Array.isArray(item.rotation) && item.rotation.length === 3) {
-      placed.rotation.set(Number(item.rotation[0]) || 0, Number(item.rotation[1]) || 0, Number(item.rotation[2]) || 0);
-    }
-    if (Array.isArray(item.scale) && item.scale.length === 3) {
-      placed.scale.set(Number(item.scale[0]) || 1, Number(item.scale[1]) || 1, Number(item.scale[2]) || 1);
-    }
-    enforceUniformScale(placed);
-    clampPlacedAboveFloor(placed);
-    scene.add(placed);
-    state.placedObjects.push(placed);
-  }
-
-  if (state.placedObjects.length) {
-    setSelectedPlaced(state.placedObjects[0]);
-  } else {
-    setSelectedPlaced(null);
-  }
-  renderPlacedList();
+  replacePlacedFromSerialized(data, true, false);
   return state.placedObjects.length;
 }
 
@@ -738,11 +1523,36 @@ function renderPlacedList() {
   }
   for (const obj of state.placedObjects) {
     const def = obj.userData.objectDef || {};
+    const wrapper = document.createElement('div');
+    wrapper.className = 'placed-entry';
+
     const item = document.createElement('button');
+    item.type = 'button';
     item.className = `placed-item${state.selectedPlaced === obj ? ' active' : ''}`;
     const label = document.createElement('span');
     label.className = 'placed-name';
     label.textContent = def.objectName || 'Unknown';
+
+    const actions = document.createElement('span');
+    actions.className = 'placed-actions';
+
+    const nodeBtn = document.createElement('button');
+    nodeBtn.type = 'button';
+    nodeBtn.className = `placed-node-toggle${obj.userData.nodeEditorActive ? ' active' : ''}`;
+    nodeBtn.textContent = 'Nodes';
+    const templateAvailable = hasMapgroupTemplate(obj);
+    nodeBtn.disabled = !templateAvailable && !(obj.userData.mapgroupNodes?.length > 0);
+    if (!templateAvailable && !(obj.userData.mapgroupNodes?.length > 0)) {
+      nodeBtn.title = 'No mapgroupproto nodes available for this object';
+    }
+    nodeBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      setSelectedPlaced(obj);
+      const currentlyActive = Boolean(obj.userData.nodeEditorActive);
+      setNodeEditorActive(obj, !currentlyActive);
+      schedulePersistPlacedObjects();
+    });
+
     const del = document.createElement('button');
     del.className = 'placed-delete';
     del.type = 'button';
@@ -753,10 +1563,89 @@ function renderPlacedList() {
       event.stopPropagation();
       deletePlacedObject(obj);
     });
+
+    actions.appendChild(nodeBtn);
+    actions.appendChild(del);
     item.appendChild(label);
-    item.appendChild(del);
+    item.appendChild(actions);
     item.addEventListener('click', () => setSelectedPlaced(obj));
-    ui.placedList.appendChild(item);
+    wrapper.appendChild(item);
+
+    if (obj.userData.nodeEditorActive) {
+      const panel = document.createElement('div');
+      panel.className = 'placed-node-panel';
+      const nodes = cloneMapgroupNodes(obj.userData.mapgroupNodes);
+      if (!nodes.length) {
+        const empty = document.createElement('div');
+        empty.className = 'muted';
+        empty.textContent = 'No nodes.';
+        panel.appendChild(empty);
+      }
+      for (let i = 0; i < nodes.length; i += 1) {
+        const row = document.createElement('div');
+        row.className = 'node-row';
+        const text = document.createElement('span');
+        text.textContent = `${nodes[i].container || 'node'} #${i + 1}`;
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'node-remove';
+        removeBtn.textContent = 'Remove';
+        removeBtn.addEventListener('click', (event) => {
+          event.stopPropagation();
+          const before = cloneMapgroupNodes(obj.userData.mapgroupNodes);
+          obj.userData.mapgroupNodes = cloneMapgroupNodes(obj.userData.mapgroupNodes).filter((_, idx) => idx !== i);
+          rebuildPlacedNodeMarkers(obj);
+          const after = cloneMapgroupNodes(obj.userData.mapgroupNodes);
+          pushUndo(() => {
+            obj.userData.mapgroupNodes = before;
+            rebuildPlacedNodeMarkers(obj);
+            renderPlacedList();
+          });
+          if (!after.length) {
+            setNodeEditorActive(obj, false);
+          } else {
+            renderPlacedList();
+          }
+          schedulePersistPlacedObjects();
+        });
+        row.appendChild(text);
+        row.appendChild(removeBtn);
+        panel.appendChild(row);
+      }
+
+      const addBtn = document.createElement('button');
+      addBtn.type = 'button';
+      addBtn.className = 'node-add';
+      addBtn.textContent = 'Add Node';
+      addBtn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        const before = cloneMapgroupNodes(obj.userData.mapgroupNodes);
+        const next = cloneMapgroupNodes(obj.userData.mapgroupNodes);
+        const newIndex = next.length;
+        next.push({
+          pos: [0, 0, 0],
+          range: 0.35,
+          height: 1,
+          flags: 0,
+          container: 'custom',
+        });
+        obj.userData.mapgroupNodes = next;
+        rebuildPlacedNodeMarkers(obj);
+        pushUndo(() => {
+          obj.userData.mapgroupNodes = before;
+          rebuildPlacedNodeMarkers(obj);
+          renderPlacedList();
+        });
+        selectNodeMarker(obj, newIndex);
+        updateSelectionOutlineStyles();
+        renderPlacedList();
+        schedulePersistPlacedObjects();
+      });
+      panel.appendChild(addBtn);
+      wrapper.appendChild(panel);
+    }
+
+    ui.placedList.appendChild(wrapper);
   }
 }
 
@@ -765,6 +1654,13 @@ function deletePlacedObject(target) {
   const deleted = target;
   const index = state.placedObjects.indexOf(deleted);
   if (index < 0) return;
+  if (state.activeNodeEditorInstanceId === deleted.userData.instanceId) {
+    state.activeNodeEditorInstanceId = null;
+  }
+  if (state.selectedNodeHolder === deleted) {
+    clearSelectedNodeMarker();
+    refreshTransformAttachment();
+  }
   scene.remove(deleted);
   state.placedObjects = state.placedObjects.filter((o) => o !== deleted);
   pushUndo(() => {
@@ -786,32 +1682,48 @@ function deletePlacedObject(target) {
 function updateSelectionOutlineStyles() {
   for (const placed of state.placedObjects) {
     const isSelected = placed === state.selectedPlaced;
+    const nodeEditActive = Boolean(placed.userData.nodeEditorActive);
     const solid = placed.children.find((c) => c.name === 'solid');
     const wire = placed.children.find((c) => c.name === 'wire');
     const centerNode = placed.children.find((c) => c.name === 'centerNode');
+    const nodeGroup = getNodeGroup(placed);
 
     if (wire?.material?.color) {
       wire.material.color.set(isSelected ? 0xffcc33 : 0x8dc2ff);
     }
     if (solid?.material) {
-      solid.material.emissiveIntensity = isSelected ? 0.55 : 0.25;
-      solid.material.opacity = isSelected ? 1 : 0.94;
+      solid.material.emissiveIntensity = nodeEditActive ? 0.16 : (isSelected ? 0.55 : 0.25);
+      solid.material.opacity = nodeEditActive ? 0.38 : (isSelected ? 1 : 0.94);
     }
     if (centerNode) {
       centerNode.scale.setScalar(isSelected ? 1.35 : 1);
+    }
+    if (nodeGroup) {
+      nodeGroup.visible = nodeEditActive;
+      for (const marker of nodeGroup.children) {
+        const isNodeSelected = marker === state.selectedNodeMarker;
+        if (marker.material?.emissiveIntensity !== undefined) {
+          marker.material.emissiveIntensity = isNodeSelected ? 1.4 : 0.9;
+        }
+        marker.scale.setScalar(isNodeSelected ? 1.28 : 1);
+      }
     }
   }
 }
 
 function filterCatalog() {
   const q = ui.search.value.trim().toLowerCase();
+  const folder = state.selectedFolder;
   state.filtered = !q
-    ? state.catalog
+    ? state.catalog.filter((o) => !folder || o.path === folder || o.path.startsWith(`${folder}/`))
     : state.catalog.filter((o) =>
-      (o.objectName || '').toLowerCase().includes(q)
-      || (o.inGameName || '').toLowerCase().includes(q)
-      || (o.category || '').toLowerCase().includes(q)
-      || (o.path || '').toLowerCase().includes(q)
+      (
+        (o.objectName || '').toLowerCase().includes(q)
+        || (o.inGameName || '').toLowerCase().includes(q)
+        || (o.category || '').toLowerCase().includes(q)
+        || (o.path || '').toLowerCase().includes(q)
+      )
+      && (!folder || o.path === folder || o.path.startsWith(`${folder}/`))
     );
   renderCatalog();
 }
@@ -826,6 +1738,8 @@ function buildBoxMesh(objDef, dimsOverride = null) {
   holder.userData.objectDef = objDef;
   holder.userData.dims = [...finalDims];
   holder.userData.center = [...center];
+  holder.userData.mapgroupNodes = [];
+  holder.userData.nodeEditorActive = false;
 
   const geom = new THREE.BoxGeometry(finalDims[0], finalDims[1], finalDims[2]);
   const mat = new THREE.MeshStandardMaterial({
@@ -866,9 +1780,14 @@ function buildBoxMesh(objDef, dimsOverride = null) {
   centerNode.castShadow = true;
   centerNode.receiveShadow = true;
 
+  const nodeGroup = new THREE.Group();
+  nodeGroup.name = 'mapgroupNodes';
+  nodeGroup.visible = false;
+
   holder.add(solid);
   holder.add(wire);
   holder.add(centerNode);
+  holder.add(nodeGroup);
   return holder;
 }
 
@@ -939,7 +1858,7 @@ function placeAt(point, objDef, shouldTrackUndo = true) {
   const placed = buildBoxMesh(objDef);
   placed.position.set(
     Math.round(point.x * 4) / 4,
-    FLOOR_Y,
+    Math.round(point.y * 4) / 4,
     Math.round(point.z * 4) / 4,
   );
   clampPlacedAboveFloor(placed);
@@ -962,26 +1881,153 @@ function placeAt(point, objDef, shouldTrackUndo = true) {
   }
 }
 
+function groundHeightAt(x, z) {
+  if (state.terrainMode === 'chernarus' && state.terrainMesh?.visible) {
+    const downRay = new THREE.Raycaster(
+      new THREE.Vector3(x, 4000, z),
+      new THREE.Vector3(0, -1, 0),
+      0,
+      10000,
+    );
+    const hit = downRay.intersectObject(state.terrainMesh, true)[0];
+    if (hit) return hit.point.y;
+  }
+  return FLOOR_Y;
+}
+
+function applyProceduralTemplate(template) {
+  if (!template) return;
+  const previous = serializePlacedObjects();
+  if (state.placedObjects.length > 0) {
+    const ok = window.confirm('Replace current placed objects with this procedural layout?');
+    if (!ok) return;
+  }
+
+  const baseX = Math.round(orbit.target.x);
+  const baseZ = Math.round(orbit.target.z);
+  const next = [];
+  const placedFootprints = [];
+
+  const radiusForDef = (def, scale = 1, role = '') => {
+    const dims = Array.isArray(def?.dimensionsVisual) ? def.dimensionsVisual : [6, 4, 6];
+    const sx = Math.max(1, Number(dims[0]) || 1) * scale;
+    const sz = Math.max(1, Number(dims[2]) || 1) * scale;
+    let r = Math.sqrt((sx * sx) + (sz * sz)) * 0.5;
+    const roleLower = String(role || '').toLowerCase();
+    if (roleLower === 'fence') r *= 0.36;
+    if (roleLower === 'tree') r *= 0.5;
+    if (roleLower === 'garden') r *= 0.75;
+    const minR = roleLower === 'fence' ? 0.8 : roleLower === 'tree' ? 1.0 : 1.8;
+    return Math.max(minR, r);
+  };
+
+  const spacingMargin = 2.2;
+  const overlapsAny = (x, z, r) => {
+    for (const fp of placedFootprints) {
+      const dx = x - fp.x;
+      const dz = z - fp.z;
+      const minDist = r + fp.r + spacingMargin;
+      if ((dx * dx) + (dz * dz) < minDist * minDist) return true;
+    }
+    return false;
+  };
+
+  const findClearPlacement = (targetX, targetZ, r) => {
+    if (!overlapsAny(targetX, targetZ, r)) return { x: targetX, z: targetZ };
+    const maxRings = 16;
+    for (let ring = 1; ring <= maxRings; ring += 1) {
+      const ringRadius = ring * Math.max(1.8, r * 0.66);
+      const samples = 12 + ring * 5;
+      for (let i = 0; i < samples; i += 1) {
+        const a = (i / samples) * Math.PI * 2;
+        const x = targetX + Math.cos(a) * ringRadius;
+        const z = targetZ + Math.sin(a) * ringRadius;
+        if (!overlapsAny(x, z, r)) return { x, z };
+      }
+    }
+    return { x: targetX, z: targetZ };
+  };
+
+  for (let bi = 0; bi < template.blocks.length; bi += 1) {
+    const block = template.blocks[bi];
+    const def = template.blockDefs?.[bi] || null;
+    if (!def) continue;
+
+    const jitter = Number(template.jitter) || 0;
+    const jx = jitter ? (Math.random() * 2 - 1) * jitter : 0;
+    const jz = jitter ? (Math.random() * 2 - 1) * jitter : 0;
+    const targetX = baseX + block.x + jx;
+    const targetZ = baseZ + block.z + jz;
+    const s = Number(block.scale || 1);
+    const radius = radiusForDef(def, s, block.role);
+    const clear = findClearPlacement(targetX, targetZ, radius);
+    const x = clear.x;
+    const z = clear.z;
+    const y = groundHeightAt(x, z);
+    const yaw = Number(block.rot || 0) + (Math.random() * 10 - 5);
+
+    const placed = buildBoxMesh(def);
+    placed.position.set(Math.round(x * 4) / 4, Math.round(y * 4) / 4, Math.round(z * 4) / 4);
+    placed.rotation.y = THREE.MathUtils.degToRad(yaw);
+    placed.scale.set(s, s, s);
+    enforceUniformScale(placed);
+    clampPlacedAboveFloor(placed);
+    scene.add(placed);
+    next.push(placed);
+    placedFootprints.push({ x, z, r: radius });
+    spawnPlaceEdgeFlash(placed);
+    spawnPlaceImpactEffect(placed);
+  }
+
+  for (const obj of state.placedObjects) scene.remove(obj);
+  state.placedObjects = next;
+  state.activeNodeEditorInstanceId = null;
+  clearSelectedNodeMarker();
+  refreshTransformAttachment();
+
+  if (next.length) {
+    setSelectedPlaced(next[0]);
+  } else {
+    setSelectedPlaced(null);
+  }
+  renderPlacedList();
+  schedulePersistPlacedObjects();
+
+  pushUndo(() => {
+    replacePlacedFromSerialized(previous, false, true);
+  });
+  setStatus(`Procedural layout generated: ${template.name} (${next.length} objects)`);
+}
+
 function screenToGround(clientX, clientY) {
   const rect = ui.canvas.getBoundingClientRect();
   mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
   mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(mouse, camera);
+  if (state.terrainMode === 'chernarus' && state.terrainMesh?.visible) {
+    const terrainHit = raycaster.intersectObject(state.terrainMesh, true)[0];
+    if (terrainHit) return terrainHit;
+  }
   return raycaster.intersectObject(ground)[0] || null;
 }
 
 function setSelectedPlaced(obj) {
   state.selectedPlaced = obj;
   if (!obj) {
-    transform.detach();
+    clearSelectedNodeMarker();
+    refreshTransformAttachment();
     setStatus('No object selected.');
     updateSelectionOutlineStyles();
     renderPlacedList();
     return;
   }
-  transform.attach(obj);
   const def = obj.userData.objectDef;
-  setStatus(`Selected: ${def.objectName} (${describeDimensionSource(def)})`);
+  const baseStatus = `Selected: ${def.objectName} (${describeDimensionSource(def)})`;
+  setStatus(obj.userData.nodeEditorActive ? `${baseStatus} | Node edit mode` : baseStatus);
+  if (!obj.userData.nodeEditorActive && state.selectedNodeHolder !== obj) {
+    clearSelectedNodeMarker();
+  }
+  refreshTransformAttachment();
   syncSelectionFields();
   updateSelectionOutlineStyles();
   renderPlacedList();
@@ -1099,6 +2145,7 @@ function exportSceneJson() {
     path: o.userData.objectDef.path || null,
     dimensionsVisual: o.userData.dims,
     centerOffset: o.userData.center,
+    mapgroupNodes: cloneMapgroupNodes(o.userData.mapgroupNodes),
     position: [o.position.x, o.position.y, o.position.z],
     rotationEuler: [o.rotation.x, o.rotation.y, o.rotation.z],
   }));
@@ -1116,6 +2163,9 @@ function clearPlaced(shouldPersist = true) {
   for (const obj of state.placedObjects) scene.remove(obj);
   state.placedObjects = [];
   state.undoStack = [];
+  state.activeNodeEditorInstanceId = null;
+  clearSelectedNodeMarker();
+  refreshTransformAttachment();
   setSelectedPlaced(null);
   renderPlacedList();
   if (shouldPersist) schedulePersistPlacedObjects();
@@ -1152,6 +2202,10 @@ function importSceneJson(text) {
     }
     if (Array.isArray(item.rotationEuler) && item.rotationEuler.length === 3) {
       placed.rotation.set(item.rotationEuler[0], item.rotationEuler[1], item.rotationEuler[2]);
+    }
+    if (Array.isArray(item.mapgroupNodes)) {
+      placed.userData.mapgroupNodes = cloneMapgroupNodes(item.mapgroupNodes);
+      rebuildPlacedNodeMarkers(placed);
     }
     enforceUniformScale(placed);
     clampPlacedAboveFloor(placed);
@@ -1202,6 +2256,10 @@ function importDayzEditorJson(text) {
       const [rx, ry, rz] = fromDayzOrientation(item.Orientation);
       placed.rotation.set(rx, ry, rz);
     }
+    if (Array.isArray(item.mapgroupNodes)) {
+      placed.userData.mapgroupNodes = cloneMapgroupNodes(item.mapgroupNodes);
+      rebuildPlacedNodeMarkers(placed);
+    }
     enforceUniformScale(placed);
     clampPlacedAboveFloor(placed);
     scene.add(placed);
@@ -1221,6 +2279,23 @@ ui.canvas.addEventListener('pointerdown', (event) => {
   mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(mouse, camera);
+
+  const nodeHits = raycaster
+    .intersectObjects(state.placedObjects, true)
+    .filter((h) => h.object?.name?.startsWith('mapgroupNode-') && h.object.parent?.visible);
+  if (nodeHits.length > 0) {
+    const hit = nodeHits[0];
+    let root = hit.object;
+    while (root.parent && !state.placedObjects.includes(root)) root = root.parent;
+    if (state.placedObjects.includes(root)) {
+      setSelectedPlaced(root);
+      selectNodeMarker(root, Number(hit.object.userData.nodeIndex) || 0);
+      clearStickyCatalog();
+      renderCatalog();
+      updateSelectionOutlineStyles();
+      return;
+    }
+  }
 
   const placedHits = raycaster.intersectObjects(state.placedObjects, true);
   if (placedHits.length > 0) {
@@ -1251,7 +2326,7 @@ ui.canvas.addEventListener('pointermove', (event) => {
   if (!hit) return;
   state.stickyPreview.position.set(
     Math.round(hit.point.x * 4) / 4,
-    FLOOR_Y,
+    Math.round(hit.point.y * 4) / 4,
     Math.round(hit.point.z * 4) / 4,
   );
   clampPlacedAboveFloor(state.stickyPreview);
@@ -1289,6 +2364,13 @@ document.querySelectorAll('[data-mode]').forEach((button) => {
 
 ui.search.addEventListener('input', filterCatalog);
 
+if (ui.folderFilter) {
+  ui.folderFilter.addEventListener('change', () => {
+    state.selectedFolder = ui.folderFilter.value || '';
+    filterCatalog();
+  });
+}
+
 if (ui.moveSpeed) {
   ui.moveSpeed.addEventListener('input', () => {
     state.moveSpeed = Number(ui.moveSpeed.value) || 12;
@@ -1303,9 +2385,38 @@ if (ui.sprintMultiplier) {
   });
 }
 
+if (ui.terrainHeightScale) {
+  ui.terrainHeightScale.addEventListener('input', () => {
+    state.terrainHeightScale = Number(ui.terrainHeightScale.value) || 1;
+    if (ui.terrainHeightScaleValue) ui.terrainHeightScaleValue.textContent = `${state.terrainHeightScale.toFixed(1)}x`;
+    applyTerrainHeightScale();
+  });
+}
+
+if (ui.terrainMode) {
+  ui.terrainMode.addEventListener('change', () => {
+    setTerrainMode(ui.terrainMode.value);
+  });
+}
+
 ui.exportScene.addEventListener('click', downloadDayzEditorJson);
 ui.copyExport.addEventListener('click', copyDayzExportToClipboard);
 ui.undoAction.addEventListener('click', undoLastAction);
+if (ui.openProcedural) {
+  ui.openProcedural.addEventListener('click', () => {
+    openProceduralOverlay();
+  });
+}
+if (ui.closeProcedural) {
+  ui.closeProcedural.addEventListener('click', () => {
+    closeProceduralOverlay();
+  });
+}
+if (ui.proceduralOverlay) {
+  ui.proceduralOverlay.addEventListener('click', (event) => {
+    if (event.target === ui.proceduralOverlay) closeProceduralOverlay();
+  });
+}
 
 ui.importScene.addEventListener('change', async (event) => {
   const file = event.target.files?.[0];
@@ -1330,6 +2441,8 @@ ui.duplicateSelected.addEventListener('click', () => {
   duplicate.position.copy(src.position).add(new THREE.Vector3(0.7, 0, 0.7));
   duplicate.rotation.copy(src.rotation);
   duplicate.scale.copy(src.scale);
+  duplicate.userData.mapgroupNodes = cloneMapgroupNodes(src.userData.mapgroupNodes);
+  rebuildPlacedNodeMarkers(duplicate);
   enforceUniformScale(duplicate);
   clampPlacedAboveFloor(duplicate);
   scene.add(duplicate);
@@ -1370,8 +2483,18 @@ window.addEventListener('keydown', (event) => {
   }
 
   if (event.code === 'Space') {
+    if (ui.proceduralOverlay?.classList.contains('open')) {
+      event.preventDefault();
+      return;
+    }
     event.preventDefault();
     toggleLookMode();
+    return;
+  }
+
+  if (event.key === 'Escape' && ui.proceduralOverlay?.classList.contains('open')) {
+    event.preventDefault();
+    closeProceduralOverlay();
     return;
   }
 
@@ -1456,6 +2579,14 @@ async function loadCatalog() {
 
       state.catalog = payload.map(normalizeCatalogEntry);
       state.catalog.sort((a, b) => (a.objectName || '').localeCompare(b.objectName || ''));
+      state.folderPaths = Array.from(
+        new Set(
+          state.catalog
+            .map((o) => (o.path || '').trim())
+            .filter((p) => p.length > 0),
+        ),
+      ).sort((a, b) => a.localeCompare(b));
+      rebuildFolderFilter();
       state.filtered = state.catalog;
       state.catalogSource = source;
       renderCatalog();
@@ -1480,6 +2611,57 @@ async function loadCatalog() {
   }
 }
 
+async function loadTerrainRepresentation() {
+  if (state.terrainMesh) return true;
+  if (!state.terrainLoadPromise) {
+    state.terrainLoadPromise = (async () => {
+      try {
+        const { mesh, wire } = await loadHeightmapTerrain();
+        state.terrainMesh = mesh;
+        state.terrainWire = wire;
+        scene.add(mesh);
+        scene.add(wire);
+        applyTerrainHeightScale();
+        return true;
+      } catch (error) {
+        console.warn('Terrain load failed, using flat plane:', error);
+        return false;
+      }
+    })();
+  }
+  return state.terrainLoadPromise;
+}
+
+async function setTerrainMode(mode) {
+  const nextMode = mode === 'chernarus' ? 'chernarus' : 'flat';
+  state.terrainMode = nextMode;
+
+  if (nextMode === 'chernarus') {
+    const ok = await loadTerrainRepresentation();
+    if (ok && state.terrainMesh) {
+      ground.visible = false;
+      state.terrainMesh.visible = true;
+      if (state.terrainWire) state.terrainWire.visible = true;
+      grid.visible = false;
+      if (camera.position.y < 700) {
+        camera.position.y = 760;
+        orbit.target.y = 380;
+        orbit.update();
+      }
+      setStatus('Terrain: Chernarus');
+      return;
+    }
+    state.terrainMode = 'flat';
+    if (ui.terrainMode) ui.terrainMode.value = 'flat';
+  }
+
+  ground.visible = true;
+  grid.visible = true;
+  if (state.terrainMesh) state.terrainMesh.visible = false;
+  if (state.terrainWire) state.terrainWire.visible = false;
+  setStatus('Terrain: Flat');
+}
+
 function animate() {
   requestAnimationFrame(animate);
   const delta = Math.min(clock.getDelta(), 0.1);
@@ -1496,5 +2678,12 @@ function animate() {
 }
 
 renderPlacedList();
+if (ui.terrainMode) {
+  setTerrainMode(ui.terrainMode.value || 'flat');
+} else {
+  setTerrainMode('flat');
+}
+if (ui.terrainHeightScaleValue) ui.terrainHeightScaleValue.textContent = `${state.terrainHeightScale.toFixed(1)}x`;
+loadMapgroupData();
 loadCatalog();
 animate();

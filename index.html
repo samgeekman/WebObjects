@@ -23,6 +23,12 @@
           <span>Search object</span>
           <input id="searchInput" placeholder="fuelstation, garage, fence..." />
         </label>
+        <label class="field">
+          <span>DZ Folder</span>
+          <select id="folderFilter">
+            <option value="">All folders</option>
+          </select>
+        </label>
         <div id="objectList" class="object-list"></div>
       </aside>
 
@@ -57,6 +63,7 @@
         <button id="deleteSelected"><span class="btn-icon">🗑</span><span>Delete</span></button>
         <button id="duplicateSelected"><span class="btn-icon">⧉</span><span>Duplicate</span></button>
         <button id="undoAction"><span class="btn-icon">↶</span><span>Undo</span></button>
+        <button id="openProcedural"><span class="btn-icon">🧩</span><span>Procedural</span></button>
         <label class="speed-control">
           Speed
           <input id="moveSpeed" type="range" min="2" max="40" step="1" value="12" />
@@ -67,9 +74,32 @@
           <input id="sprintMultiplier" type="range" min="1" max="4" step="0.1" value="2.2" />
           <span id="sprintMultiplierValue">2.2x</span>
         </label>
+        <label class="speed-control">
+          Terrain
+          <select id="terrainMode">
+            <option value="flat">Flat terrain</option>
+            <option value="chernarus">Chernarus</option>
+          </select>
+        </label>
+        <label class="speed-control">
+          Height
+          <input id="terrainHeightScale" type="range" min="0.4" max="4" step="0.1" value="1.0" />
+          <span id="terrainHeightScaleValue">1.0x</span>
+        </label>
       </div>
       <div id="statusText" class="muted toolbar-status">Ready.</div>
     </footer>
+
+    <div id="proceduralOverlay" class="overlay" aria-hidden="true">
+      <div class="overlay-card">
+        <div class="overlay-head">
+          <h3>Procedural Layouts</h3>
+          <button id="closeProcedural" type="button">Close</button>
+        </div>
+        <p class="muted">Pick a generated starter layout. Existing placements will be replaced.</p>
+        <div id="proceduralGrid" class="procedural-grid"></div>
+      </div>
+    </div>
 
     <script type="module" src="./src/main.js"></script>
   </body>
