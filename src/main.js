@@ -636,18 +636,23 @@ function buildProceduralResolvedSet() {
     const dz = b.z - a.z;
     const edgeLen = Math.hypot(dx, dz);
     if (edgeLen < 0.001) return;
-    // Use ceil so segments slightly overlap rather than leaving visible gaps.
-    const count = Math.max(1, Math.ceil(edgeLen / fenceLen));
+    // Strict chain placement: center-to-center step equals exact fence length.
+    // This guarantees each fence end touches the next fence end.
+    const count = Math.max(1, Math.floor(edgeLen / fenceLen));
     // Fence model at yaw=0 runs along +X, so align yaw from X-axis to edge vector.
     const yaw = THREE.MathUtils.radToDeg(Math.atan2(dz, dx));
     const gateIndex = Math.floor(count / 2);
+    const dirX = dx / edgeLen;
+    const dirZ = dz / edgeLen;
+    const usedLen = count * fenceLen;
+    const edgeOffset = (edgeLen - usedLen) * 0.5;
     for (let i = 0; i < count; i += 1) {
       if (edgeName === gateSide && i === gateIndex) continue;
-      const t = (i + 0.5) / count;
+      const dist = edgeOffset + fenceLen * (i + 0.5);
       blocks.push({
         role: 'fence',
-        x: a.x + dx * t,
-        z: a.z + dz * t,
+        x: a.x + dirX * dist,
+        z: a.z + dirZ * dist,
         rot: yaw,
         scale: 1.0,
       });
