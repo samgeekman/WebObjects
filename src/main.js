@@ -459,6 +459,10 @@ function isGardenBuildingObject(obj) {
   return n.includes('greenhouse') || n.includes('glasshouse') || n.includes('shed') || p.includes('/sheds') || p.includes('/greenhouse');
 }
 
+function objectNameLower(obj) {
+  return String(obj?.objectName || '').trim().toLowerCase();
+}
+
 function collectCatalogCandidates(keywordSets, predicate = null) {
   if (!Array.isArray(keywordSets)) return [];
   for (const set of keywordSets) {
@@ -511,12 +515,14 @@ function buildProceduralResolvedSet() {
   const houseFallback = collectCatalogCandidates([['land_house']], null);
   const house = randomOf((housePrimary.length ? housePrimary : houseFallback).slice(0, 40));
 
-  const fencePrimary = collectCatalogCandidates([['fence'], ['hbarrier'], ['wall_fence']], isFenceObject);
-  const fenceFallback = collectCatalogCandidates([['fence'], ['barrier']], null);
-  const fence = randomOf((fencePrimary.length ? fencePrimary : fenceFallback).slice(0, 40));
+  const allowedFenceNames = new Set(['staticobj_wall_wood1_5', 'staticobj_wall_wood1d_5_2']);
+  const fencePool = state.catalog.filter((o) => allowedFenceNames.has(objectNameLower(o)));
+  const fence = randomOf(fencePool);
 
-  let treePool = collectCatalogCandidates([['tree'], ['apple'], ['plum'], ['pear']], isTreeObject).slice(0, 80);
-  if (!treePool.length) treePool = collectCatalogCandidates([['tree'], ['bush']], null).slice(0, 80);
+  const treePool = state.catalog.filter((o) => {
+    const n = objectNameLower(o);
+    return n.includes('fagussylvatica') || n.includes('betulapendula');
+  }).slice(0, 120);
   const gardenPrimary = collectCatalogCandidates([['greenhouse'], ['glasshouse'], ['shed']], isGardenBuildingObject);
   const gardenFallback = collectCatalogCandidates([['shed'], ['greenhouse']], null);
   const gardenBuilding = randomOf((gardenPrimary.length ? gardenPrimary : gardenFallback).slice(0, 50));
@@ -535,35 +541,42 @@ function buildProceduralResolvedSet() {
   });
   blockDefs.push(house || null);
 
-  const fenceSegments = [
-    { x: -half, z: -half, rot: 0 },
-    { x: 0, z: -half, rot: 0 },
-    { x: half, z: -half, rot: 0 },
-    { x: -half, z: half, rot: 0 },
-    { x: 0, z: half, rot: 0 },
-    { x: half, z: half, rot: 0 },
-    { x: -half, z: 0, rot: 90 },
-    { x: half, z: 0, rot: 90 },
-  ];
+  const fenceLen = (() => {
+    if (!fence || !Array.isArray(fence.dimensionsVisual)) return 5;
+    const d = fence.dimensionsVisual.map((v) => Math.abs(Number(v) || 0));
+    return Math.max(4.5, Math.min(5.5, Math.max(d[0] || 5, d[2] || 5)));
+  })();
+  const gateWidth = fenceLen * 1.05;
+  const start = -half + fenceLen / 2;
+  const end = half - fenceLen / 2;
 
-  for (const seg of fenceSegments) {
-    if (
-      (gateSide === 'south' && seg.x === 0 && seg.z === half)
-      || (gateSide === 'north' && seg.x === 0 && seg.z === -half)
-      || (gateSide === 'west' && seg.x === -half && seg.z === 0)
-      || (gateSide === 'east' && seg.x === half && seg.z === 0)
-    ) {
-      continue;
+  const pushFenceRun = (side) => {
+    for (let pos = start; pos <= end + 0.001; pos += fenceLen) {
+      if (Math.abs(pos) < gateWidth / 2 && side === gateSide) continue;
+      if (side === 'north' || side === 'south') {
+        blocks.push({
+          role: 'fence',
+          x: pos,
+          z: side === 'north' ? -half : half,
+          rot: 0,
+          scale: 1.0,
+        });
+      } else {
+        blocks.push({
+          role: 'fence',
+          x: side === 'west' ? -half : half,
+          z: pos,
+          rot: 90,
+          scale: 1.0,
+        });
+      }
+      blockDefs.push(fence || null);
     }
-    blocks.push({
-      role: 'fence',
-      x: seg.x,
-      z: seg.z,
-      rot: seg.rot,
-      scale: randomOf([0.9, 1.0, 1.05]),
-    });
-    blockDefs.push(fence || null);
-  }
+  };
+  pushFenceRun('north');
+  pushFenceRun('south');
+  pushFenceRun('west');
+  pushFenceRun('east');
 
   const treeSpots = [
     { x: -half + 4, z: -half + 4 },
