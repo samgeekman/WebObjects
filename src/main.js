@@ -8,22 +8,21 @@ const catalogSources = [
   './public/data/objects.min.json',
 ];
 const FLOOR_Y = 0;
+const LAYOUT_STORAGE_KEY = 'sams_dayz_layout_tool_v1';
 
 const ui = {
   canvas: document.getElementById('viewport'),
   viewportWrap: document.getElementById('viewportWrap'),
   list: document.getElementById('objectList'),
+  placedList: document.getElementById('placedList'),
   search: document.getElementById('searchInput'),
-  selectionInfo: document.getElementById('selectionInfo'),
-  dimX: document.getElementById('dimX'),
-  dimY: document.getElementById('dimY'),
-  dimZ: document.getElementById('dimZ'),
-  applyDims: document.getElementById('applyDims'),
+  statusText: document.getElementById('statusText'),
   exportScene: document.getElementById('exportScene'),
   copyExport: document.getElementById('copyExport'),
   undoAction: document.getElementById('undoAction'),
   importScene: document.getElementById('importScene'),
   deleteSelected: document.getElementById('deleteSelected'),
+  duplicateSelected: document.getElementById('duplicateSelected'),
 };
 
 const state = {
@@ -48,7 +47,14 @@ const state = {
   isTransformDragging: false,
   lookYaw: 0,
   lookPitch: 0,
+  lookLastX: null,
+  lookLastY: null,
   catalogSource: null,
+  stickyCatalog: null,
+  stickyPreview: null,
+  placeEdgeEffects: [],
+  placeImpactEffects: [],
+  persistTimer: null,
 };
 
 const renderer = new THREE.WebGLRenderer({ canvas: ui.canvas, antialias: true });
@@ -94,6 +100,7 @@ transform.addEventListener('mouseUp', () => {
       applySnapshot(objectRef, before);
       setSelectedPlaced(objectRef);
     });
+    schedulePersistPlacedObjects();
   }
   transformStartSnapshot = null;
 });
@@ -232,6 +239,10 @@ function formatDim(dims) {
   return `${dims.map((v) => Number(v).toFixed(2)).join(' x ')}`;
 }
 
+function setStatus(message) {
+  if (ui.statusText) ui.statusText.textContent = message;
+}
+
 function describeDimensionSource(objDef) {
   const source = objDef.dimensionsSource || 'unknown';
   const status = objDef.bboxStatus || 'unknown';
@@ -265,6 +276,9 @@ function normalizeCatalogEntry(item) {
   const dims = Array.isArray(item?.dimensionsVisual) && item.dimensionsVisual.length === 3
     ? item.dimensionsVisual.map((n) => Number(n) || 2.5)
     : [2.5, 2.5, 2.5];
+  const hasKnownDimensions = (item?.bboxStatus === 'matched')
+    && Array.isArray(item?.bboxMinVisual)
+    && Array.isArray(item?.bboxMaxVisual);
 
   return {
     objectName: item?.objectName || item?.Type || 'unknown_object',
@@ -278,7 +292,101 @@ function normalizeCatalogEntry(item) {
     dimensionsVisual: dims,
     bboxMinVisual: Array.isArray(item?.bboxMinVisual) ? item.bboxMinVisual : null,
     bboxMaxVisual: Array.isArray(item?.bboxMaxVisual) ? item.bboxMaxVisual : null,
+    hasKnownDimensions,
   };
+}
+
+function serializePlacedObjects() {
+  return state.placedObjects.map((o) => {
+    const def = o.userData?.objectDef || {};
+    return {
+      objectName: def.objectName || 'unknown_object',
+      path: def.path || '',
+      category: def.category || 'Imported',
+      bboxStatus: def.bboxStatus || 'unknown',
+      dimensionsSource: def.dimensionsSource || 'unknown',
+      dimensionsVisual: o.userData?.dims || def.dimensionsVisual || [2.5, 2.5, 2.5],
+      bboxMinVisual: Array.isArray(def.bboxMinVisual) ? def.bboxMinVisual : null,
+      bboxMaxVisual: Array.isArray(def.bboxMaxVisual) ? def.bboxMaxVisual : null,
+      position: [o.position.x, o.position.y, o.position.z],
+      rotation: [o.rotation.x, o.rotation.y, o.rotation.z],
+      scale: [o.scale.x, o.scale.y, o.scale.z],
+    };
+  });
+}
+
+function persistPlacedObjectsNow() {
+  try {
+    const payload = serializePlacedObjects();
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(payload));
+  } catch (error) {
+    console.warn('Failed to persist layout:', error);
+  }
+}
+
+function schedulePersistPlacedObjects() {
+  if (state.persistTimer) clearTimeout(state.persistTimer);
+  state.persistTimer = setTimeout(() => {
+    persistPlacedObjectsNow();
+    state.persistTimer = null;
+  }, 180);
+}
+
+function restorePlacedObjectsFromStorage() {
+  let raw = null;
+  try {
+    raw = localStorage.getItem(LAYOUT_STORAGE_KEY);
+  } catch {
+    return 0;
+  }
+  if (!raw) return 0;
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return 0;
+  }
+  if (!Array.isArray(data)) return 0;
+
+  clearPlaced(false);
+
+  for (const item of data) {
+    const existing = state.catalog.find((x) => x.objectName === item.objectName);
+    const def = existing || {
+      objectName: item.objectName || 'unknown_object',
+      path: item.path || '',
+      category: item.category || 'Imported',
+      bboxStatus: item.bboxStatus || 'unknown',
+      dimensionsSource: item.dimensionsSource || 'unknown',
+      dimensionsVisual: item.dimensionsVisual || [2.5, 2.5, 2.5],
+      bboxMinVisual: Array.isArray(item.bboxMinVisual) ? item.bboxMinVisual : null,
+      bboxMaxVisual: Array.isArray(item.bboxMaxVisual) ? item.bboxMaxVisual : null,
+      hasKnownDimensions: item.bboxStatus === 'matched',
+    };
+    const dims = Array.isArray(item.dimensionsVisual) ? item.dimensionsVisual : def.dimensionsVisual;
+    const placed = buildBoxMesh(def, dims);
+    if (Array.isArray(item.position) && item.position.length === 3) {
+      placed.position.set(Number(item.position[0]) || 0, Number(item.position[1]) || 0, Number(item.position[2]) || 0);
+    }
+    if (Array.isArray(item.rotation) && item.rotation.length === 3) {
+      placed.rotation.set(Number(item.rotation[0]) || 0, Number(item.rotation[1]) || 0, Number(item.rotation[2]) || 0);
+    }
+    if (Array.isArray(item.scale) && item.scale.length === 3) {
+      placed.scale.set(Number(item.scale[0]) || 1, Number(item.scale[1]) || 1, Number(item.scale[2]) || 1);
+    }
+    clampPlacedAboveFloor(placed);
+    scene.add(placed);
+    state.placedObjects.push(placed);
+  }
+
+  if (state.placedObjects.length) {
+    setSelectedPlaced(state.placedObjects[0]);
+  } else {
+    setSelectedPlaced(null);
+  }
+  renderPlacedList();
+  return state.placedObjects.length;
 }
 
 function pushUndo(undoFn) {
@@ -289,6 +397,7 @@ function undoLastAction() {
   const undo = state.undoStack.pop();
   if (!undo) return;
   undo();
+  schedulePersistPlacedObjects();
 }
 
 function snapshotPlaced(obj) {
@@ -352,8 +461,126 @@ function applyKeyboardNavigation(deltaSeconds) {
   orbit.update();
 }
 
+function spawnPlaceEdgeFlash(placed) {
+  const wire = placed.children.find((c) => c.name === 'wire');
+  if (!wire || !wire.geometry) return;
+
+  const flashMaterial = new THREE.LineBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 1,
+    depthWrite: false,
+  });
+  const flash = new THREE.LineSegments(wire.geometry.clone(), flashMaterial);
+  flash.name = 'placeEdgeFlash';
+  flash.position.copy(wire.position);
+  flash.scale.set(1.001, 1.001, 1.001);
+  placed.add(flash);
+
+  state.placeEdgeEffects.push({
+    placed,
+    flash,
+    age: 0,
+    lifetime: 0.28,
+  });
+}
+
+function updatePlaceEdgeEffects(deltaSeconds) {
+  for (let i = state.placeEdgeEffects.length - 1; i >= 0; i -= 1) {
+    const fx = state.placeEdgeEffects[i];
+    fx.age += deltaSeconds;
+    const t = fx.age / fx.lifetime;
+    fx.flash.material.opacity = Math.max(0, 1 - t);
+    const s = 1.001 + t * 0.02;
+    fx.flash.scale.set(s, s, s);
+
+    if (fx.age >= fx.lifetime || !scene.children.includes(fx.placed)) {
+      fx.placed.remove(fx.flash);
+      fx.flash.geometry.dispose();
+      fx.flash.material.dispose();
+      state.placeEdgeEffects.splice(i, 1);
+    }
+  }
+}
+
+function spawnPlaceImpactEffect(placed) {
+  const dims = placed.userData?.dims || [2.5, 2.5, 2.5];
+  const footprint = Math.max(0.7, dims[0], dims[2]) * 0.5;
+
+  const dustCount = 12;
+  const dustGeom = new THREE.BufferGeometry();
+  const dustPositions = new Float32Array(dustCount * 3);
+  const dustVelocities = [];
+  const dustBase = new THREE.Vector3(placed.position.x, FLOOR_Y + 0.03, placed.position.z);
+
+  for (let i = 0; i < dustCount; i += 1) {
+    const angle = (i / dustCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.35;
+    const r = footprint * (0.3 + Math.random() * 0.7);
+    dustPositions[i * 3 + 0] = dustBase.x + Math.cos(angle) * r;
+    dustPositions[i * 3 + 1] = dustBase.y + Math.random() * 0.12;
+    dustPositions[i * 3 + 2] = dustBase.z + Math.sin(angle) * r;
+
+    dustVelocities.push(new THREE.Vector3(
+      Math.cos(angle) * (0.6 + Math.random() * 0.7),
+      0.2 + Math.random() * 0.28,
+      Math.sin(angle) * (0.6 + Math.random() * 0.7),
+    ));
+  }
+
+  dustGeom.setAttribute('position', new THREE.BufferAttribute(dustPositions, 3));
+  const dustMat = new THREE.PointsMaterial({
+    color: 0xb7bfc8,
+    size: 0.1 + footprint * 0.05,
+    transparent: true,
+    opacity: 0.42,
+    depthWrite: false,
+  });
+  const dustPoints = new THREE.Points(dustGeom, dustMat);
+  scene.add(dustPoints);
+
+  state.placeImpactEffects.push({
+    dustPoints,
+    dustVelocities,
+    age: 0,
+    lifetime: 0.26,
+  });
+}
+
+function updatePlaceImpactEffects(deltaSeconds) {
+  for (let i = state.placeImpactEffects.length - 1; i >= 0; i -= 1) {
+    const fx = state.placeImpactEffects[i];
+    fx.age += deltaSeconds;
+    const t = Math.min(1, fx.age / fx.lifetime);
+
+    const posAttr = fx.dustPoints.geometry.getAttribute('position');
+    for (let p = 0; p < fx.dustVelocities.length; p += 1) {
+      const v = fx.dustVelocities[p];
+      posAttr.array[p * 3 + 0] += v.x * deltaSeconds;
+      posAttr.array[p * 3 + 1] += v.y * deltaSeconds;
+      posAttr.array[p * 3 + 2] += v.z * deltaSeconds;
+      v.multiplyScalar(1 - Math.min(0.95, 5.2 * deltaSeconds));
+      v.y -= 0.8 * deltaSeconds;
+      if (posAttr.array[p * 3 + 1] < FLOOR_Y + 0.015) posAttr.array[p * 3 + 1] = FLOOR_Y + 0.015;
+    }
+    posAttr.needsUpdate = true;
+    fx.dustPoints.material.opacity = 0.42 * (1 - t);
+
+    if (t >= 1) {
+      scene.remove(fx.dustPoints);
+      fx.dustPoints.geometry.dispose();
+      fx.dustPoints.material.dispose();
+      state.placeImpactEffects.splice(i, 1);
+    }
+  }
+}
+
 function updateOrbitEnabled() {
   orbit.enabled = !state.lookMode && !state.isTransformDragging;
+}
+
+function updateCameraModeUi() {
+  ui.viewportWrap.classList.toggle('camera-mode', state.lookMode);
+  setStatus(state.lookMode ? 'Cam mode' : 'Cursor mode');
 }
 
 function syncLookAnglesFromCamera() {
@@ -379,14 +606,20 @@ function updateCameraFromLookAngles() {
 function enterLookMode() {
   if (state.lookMode) return;
   syncLookAnglesFromCamera();
-  ui.canvas.requestPointerLock();
+  state.lookMode = true;
+  state.lookLastX = null;
+  state.lookLastY = null;
+  updateOrbitEnabled();
+  updateCameraModeUi();
 }
 
 function exitLookMode() {
   if (!state.lookMode) return;
-  if (document.pointerLockElement === ui.canvas) {
-    document.exitPointerLock();
-  }
+  state.lookMode = false;
+  state.lookLastX = null;
+  state.lookLastY = null;
+  updateOrbitEnabled();
+  updateCameraModeUi();
 }
 
 function toggleLookMode() {
@@ -402,7 +635,9 @@ function renderCatalog() {
   for (const obj of state.filtered.slice(0, 300)) {
     const button = document.createElement('button');
     const imageUrl = getObjectImageUrl(obj);
-    button.className = `object-item${state.selectedCatalog?.objectName === obj.objectName ? ' active' : ''}`;
+    const isActive = state.selectedCatalog?.objectName === obj.objectName || state.stickyCatalog?.objectName === obj.objectName;
+    button.className = `object-item${isActive ? ' active' : ''}`;
+    if (!obj.hasKnownDimensions) button.title = 'Dimensions unknown';
     button.draggable = true;
     button.innerHTML = `
       <img class="object-thumb" src="${imageUrl}" alt="${obj.objectName}" loading="lazy" />
@@ -418,10 +653,13 @@ function renderCatalog() {
     });
     button.addEventListener('click', () => {
       state.selectedCatalog = obj;
+      setStickyCatalog(obj);
       renderCatalog();
-      ui.selectionInfo.textContent = `Ready to place: ${obj.objectName} (${describeDimensionSource(obj)})`;
+      setStatus(`Placement armed: ${obj.objectName}. Move mouse over scene and click to place.`);
     });
     button.addEventListener('dragstart', (event) => {
+      clearStickyCatalog();
+      renderCatalog();
       state.dragCatalog = obj;
       event.dataTransfer?.setData('text/plain', obj.objectName);
       if (event.dataTransfer) event.dataTransfer.effectAllowed = 'copy';
@@ -431,6 +669,80 @@ function renderCatalog() {
       ui.viewportWrap.classList.remove('drag-over');
     });
     ui.list.appendChild(button);
+  }
+}
+
+function renderPlacedList() {
+  if (!ui.placedList) return;
+  ui.placedList.innerHTML = '';
+  if (!state.placedObjects.length) {
+    ui.placedList.innerHTML = '<div class="muted">No placed objects yet.</div>';
+    return;
+  }
+  for (const obj of state.placedObjects) {
+    const def = obj.userData.objectDef || {};
+    const item = document.createElement('button');
+    item.className = `placed-item${state.selectedPlaced === obj ? ' active' : ''}`;
+    const label = document.createElement('span');
+    label.className = 'placed-name';
+    label.textContent = def.objectName || 'Unknown';
+    const del = document.createElement('button');
+    del.className = 'placed-delete';
+    del.type = 'button';
+    del.title = 'Delete object';
+    del.setAttribute('aria-label', 'Delete object');
+    del.textContent = '✕';
+    del.addEventListener('click', (event) => {
+      event.stopPropagation();
+      deletePlacedObject(obj);
+    });
+    item.appendChild(label);
+    item.appendChild(del);
+    item.addEventListener('click', () => setSelectedPlaced(obj));
+    ui.placedList.appendChild(item);
+  }
+}
+
+function deletePlacedObject(target) {
+  if (!target) return;
+  const deleted = target;
+  const index = state.placedObjects.indexOf(deleted);
+  if (index < 0) return;
+  scene.remove(deleted);
+  state.placedObjects = state.placedObjects.filter((o) => o !== deleted);
+  pushUndo(() => {
+    if (scene.children.includes(deleted)) return;
+    scene.add(deleted);
+    if (index >= 0 && index <= state.placedObjects.length) {
+      state.placedObjects.splice(index, 0, deleted);
+    } else {
+      state.placedObjects.push(deleted);
+    }
+    setSelectedPlaced(deleted);
+    renderPlacedList();
+  });
+  if (state.selectedPlaced === deleted) setSelectedPlaced(state.placedObjects[0] || null);
+  renderPlacedList();
+  schedulePersistPlacedObjects();
+}
+
+function updateSelectionOutlineStyles() {
+  for (const placed of state.placedObjects) {
+    const isSelected = placed === state.selectedPlaced;
+    const solid = placed.children.find((c) => c.name === 'solid');
+    const wire = placed.children.find((c) => c.name === 'wire');
+    const centerNode = placed.children.find((c) => c.name === 'centerNode');
+
+    if (wire?.material?.color) {
+      wire.material.color.set(isSelected ? 0xffcc33 : 0x8dc2ff);
+    }
+    if (solid?.material) {
+      solid.material.emissiveIntensity = isSelected ? 0.55 : 0.25;
+      solid.material.opacity = isSelected ? 1 : 0.94;
+    }
+    if (centerNode) {
+      centerNode.scale.setScalar(isSelected ? 1.35 : 1);
+    }
   }
 }
 
@@ -503,6 +815,36 @@ function buildBoxMesh(objDef, dimsOverride = null) {
   return holder;
 }
 
+function buildStickyPreview(objDef) {
+  const preview = buildBoxMesh(objDef);
+  preview.name = 'stickyPreview';
+  preview.traverse((child) => {
+    child.userData.noSelect = true;
+    if (child.material) {
+      child.material = child.material.clone();
+      if (typeof child.material.opacity === 'number') child.material.opacity = 0.38;
+      if (typeof child.material.transparent === 'boolean') child.material.transparent = true;
+      if (typeof child.material.depthWrite === 'boolean') child.material.depthWrite = false;
+    }
+  });
+  return preview;
+}
+
+function clearStickyCatalog() {
+  state.stickyCatalog = null;
+  if (state.stickyPreview) {
+    scene.remove(state.stickyPreview);
+    state.stickyPreview = null;
+  }
+}
+
+function setStickyCatalog(objDef) {
+  clearStickyCatalog();
+  state.stickyCatalog = objDef;
+  state.stickyPreview = buildStickyPreview(objDef);
+  scene.add(state.stickyPreview);
+}
+
 function setPlacedDimensions(holder, dims) {
   const finalDims = dims.map((n) => Number(n) || 1);
   const center = holder.userData.center || [0, 0, 0];
@@ -546,6 +888,10 @@ function placeAt(point, objDef, shouldTrackUndo = true) {
   scene.add(placed);
   state.placedObjects.push(placed);
   setSelectedPlaced(placed);
+  renderPlacedList();
+  spawnPlaceEdgeFlash(placed);
+  spawnPlaceImpactEffect(placed);
+  schedulePersistPlacedObjects();
 
   if (shouldTrackUndo) {
     pushUndo(() => {
@@ -553,6 +899,7 @@ function placeAt(point, objDef, shouldTrackUndo = true) {
       scene.remove(placed);
       state.placedObjects = state.placedObjects.filter((o) => o !== placed);
       if (state.selectedPlaced === placed) setSelectedPlaced(state.placedObjects[0] || null);
+      renderPlacedList();
     });
   }
 }
@@ -569,22 +916,21 @@ function setSelectedPlaced(obj) {
   state.selectedPlaced = obj;
   if (!obj) {
     transform.detach();
-    ui.selectionInfo.textContent = 'No object selected.';
+    setStatus('No object selected.');
+    updateSelectionOutlineStyles();
+    renderPlacedList();
     return;
   }
   transform.attach(obj);
   const def = obj.userData.objectDef;
-  ui.selectionInfo.textContent = `Selected: ${def.objectName} (${describeDimensionSource(def)})`;
+  setStatus(`Selected: ${def.objectName} (${describeDimensionSource(def)})`);
   syncSelectionFields();
+  updateSelectionOutlineStyles();
+  renderPlacedList();
 }
 
 function syncSelectionFields() {
-  const selected = state.selectedPlaced;
-  if (!selected) return;
-  const dims = selected.userData.dims || [1, 1, 1];
-  ui.dimX.value = dims[0].toFixed(3);
-  ui.dimY.value = dims[1].toFixed(3);
-  ui.dimZ.value = dims[2].toFixed(3);
+  // XYZ input controls removed from UI.
 }
 
 function inferEditorType(objDef) {
@@ -699,11 +1045,13 @@ function exportSceneJson() {
   URL.revokeObjectURL(url);
 }
 
-function clearPlaced() {
+function clearPlaced(shouldPersist = true) {
   for (const obj of state.placedObjects) scene.remove(obj);
   state.placedObjects = [];
   state.undoStack = [];
   setSelectedPlaced(null);
+  renderPlacedList();
+  if (shouldPersist) schedulePersistPlacedObjects();
 }
 
 function importSceneJson(text) {
@@ -719,7 +1067,7 @@ function importSceneJson(text) {
     return;
   }
 
-  clearPlaced();
+  clearPlaced(false);
 
   for (const item of data) {
     const def = state.catalog.find((x) => x.objectName === item.objectName) || {
@@ -746,6 +1094,8 @@ function importSceneJson(text) {
   if (state.placedObjects.length) {
     setSelectedPlaced(state.placedObjects[0]);
   }
+  renderPlacedList();
+  schedulePersistPlacedObjects();
 }
 
 function importDayzEditorJson(text) {
@@ -761,7 +1111,7 @@ function importDayzEditorJson(text) {
     return false;
   }
 
-  clearPlaced();
+  clearPlaced(false);
 
   for (const item of data) {
     const typeName = String(item.Type || item.DisplayName || 'UnknownObject');
@@ -791,6 +1141,8 @@ function importDayzEditorJson(text) {
   if (state.placedObjects.length) {
     setSelectedPlaced(state.placedObjects[0]);
   }
+  renderPlacedList();
+  schedulePersistPlacedObjects();
   return true;
 }
 
@@ -806,9 +1158,33 @@ ui.canvas.addEventListener('pointerdown', (event) => {
     while (root.parent && !state.placedObjects.includes(root)) root = root.parent;
     if (state.placedObjects.includes(root)) {
       setSelectedPlaced(root);
+      clearStickyCatalog();
+      renderCatalog();
+      return;
     }
   }
-  // Click-to-place disabled. Placement is drag/drop only.
+
+  if (state.stickyCatalog) {
+    const hit = screenToGround(event.clientX, event.clientY);
+    if (!hit) return;
+    const placedName = state.stickyCatalog.objectName || 'Object';
+    placeAt(hit.point, state.stickyCatalog, true);
+    clearStickyCatalog();
+    renderCatalog();
+    setStatus(`Placed: ${placedName}`);
+  }
+});
+
+ui.canvas.addEventListener('pointermove', (event) => {
+  if (!state.stickyCatalog || !state.stickyPreview) return;
+  const hit = screenToGround(event.clientX, event.clientY);
+  if (!hit) return;
+  state.stickyPreview.position.set(
+    Math.round(hit.point.x * 4) / 4,
+    FLOOR_Y,
+    Math.round(hit.point.z * 4) / 4,
+  );
+  clampPlacedAboveFloor(state.stickyPreview);
 });
 
 ui.viewportWrap.addEventListener('dragover', (event) => {
@@ -830,6 +1206,7 @@ ui.viewportWrap.addEventListener('drop', (event) => {
   ui.viewportWrap.classList.remove('drag-over');
   const hit = screenToGround(event.clientX, event.clientY);
   if (!hit) return;
+  clearStickyCatalog();
   state.selectedCatalog = state.dragCatalog;
   placeAt(hit.point, state.dragCatalog, true);
   renderCatalog();
@@ -841,27 +1218,6 @@ document.querySelectorAll('[data-mode]').forEach((button) => {
 });
 
 ui.search.addEventListener('input', filterCatalog);
-
-ui.applyDims.addEventListener('click', () => {
-  if (!state.selectedPlaced) return;
-  const dims = [Number(ui.dimX.value), Number(ui.dimY.value), Number(ui.dimZ.value)];
-  if (dims.some((v) => !Number.isFinite(v) || v <= 0)) {
-    alert('Dimensions must be positive numbers.');
-    return;
-  }
-  const selected = state.selectedPlaced;
-  const before = snapshotPlaced(selected);
-  setPlacedDimensions(selected, dims);
-  clampPlacedAboveFloor(selected);
-  const after = snapshotPlaced(selected);
-  if (!sameSnapshot(before, after)) {
-    pushUndo(() => {
-      if (!scene.children.includes(selected)) return;
-      applySnapshot(selected, before);
-      setSelectedPlaced(selected);
-    });
-  }
-});
 
 ui.exportScene.addEventListener('click', downloadDayzEditorJson);
 ui.copyExport.addEventListener('click', copyDayzExportToClipboard);
@@ -879,22 +1235,31 @@ ui.importScene.addEventListener('change', async (event) => {
 });
 
 ui.deleteSelected.addEventListener('click', () => {
+  deletePlacedObject(state.selectedPlaced);
+});
+
+ui.duplicateSelected.addEventListener('click', () => {
   if (!state.selectedPlaced) return;
-  const deleted = state.selectedPlaced;
-  const index = state.placedObjects.indexOf(deleted);
-  scene.remove(deleted);
-  state.placedObjects = state.placedObjects.filter((o) => o !== deleted);
+  const src = state.selectedPlaced;
+  const objDef = src.userData.objectDef || {};
+  const duplicate = buildBoxMesh(objDef, src.userData.dims || [2.5, 2.5, 2.5]);
+  duplicate.position.copy(src.position).add(new THREE.Vector3(0.7, 0, 0.7));
+  duplicate.rotation.copy(src.rotation);
+  duplicate.scale.copy(src.scale);
+  clampPlacedAboveFloor(duplicate);
+  scene.add(duplicate);
+  state.placedObjects.push(duplicate);
+  setSelectedPlaced(duplicate);
+  renderPlacedList();
+  schedulePersistPlacedObjects();
+
   pushUndo(() => {
-    if (scene.children.includes(deleted)) return;
-    scene.add(deleted);
-    if (index >= 0 && index <= state.placedObjects.length) {
-      state.placedObjects.splice(index, 0, deleted);
-    } else {
-      state.placedObjects.push(deleted);
-    }
-    setSelectedPlaced(deleted);
+    if (!scene.children.includes(duplicate)) return;
+    scene.remove(duplicate);
+    state.placedObjects = state.placedObjects.filter((o) => o !== duplicate);
+    if (state.selectedPlaced === duplicate) setSelectedPlaced(state.placedObjects[0] || null);
+    renderPlacedList();
   });
-  setSelectedPlaced(state.placedObjects[0] || null);
 });
 
 function keyEventTargetsInput(event) {
@@ -910,6 +1275,12 @@ window.addEventListener('keydown', (event) => {
   if (isUndo) {
     event.preventDefault();
     undoLastAction();
+    return;
+  }
+
+  if (event.key === 'Delete') {
+    event.preventDefault();
+    deletePlacedObject(state.selectedPlaced);
     return;
   }
 
@@ -942,16 +1313,29 @@ window.addEventListener('blur', () => {
   exitLookMode();
 });
 
-document.addEventListener('pointerlockchange', () => {
-  state.lookMode = document.pointerLockElement === ui.canvas;
-  updateOrbitEnabled();
+window.addEventListener('beforeunload', () => {
+  persistPlacedObjectsNow();
 });
 
-document.addEventListener('mousemove', (event) => {
+ui.canvas.addEventListener('mouseleave', () => {
+  state.lookLastX = null;
+  state.lookLastY = null;
+});
+
+window.addEventListener('mousemove', (event) => {
   if (!state.lookMode) return;
+  if (state.lookLastX == null || state.lookLastY == null) {
+    state.lookLastX = event.clientX;
+    state.lookLastY = event.clientY;
+    return;
+  }
   const sensitivity = 0.0024;
-  state.lookYaw -= event.movementX * sensitivity;
-  state.lookPitch -= event.movementY * sensitivity;
+  const deltaX = event.clientX - state.lookLastX;
+  const deltaY = event.clientY - state.lookLastY;
+  state.lookLastX = event.clientX;
+  state.lookLastY = event.clientY;
+  state.lookYaw -= deltaX * sensitivity;
+  state.lookPitch -= deltaY * sensitivity;
   state.lookPitch = THREE.MathUtils.clamp(state.lookPitch, -Math.PI / 2 + 0.01, Math.PI / 2 - 0.01);
   updateCameraFromLookAngles();
 });
@@ -970,7 +1354,12 @@ async function loadCatalog() {
       state.filtered = state.catalog;
       state.catalogSource = source;
       renderCatalog();
-      ui.selectionInfo.textContent = `Catalog loaded: ${state.catalog.length.toLocaleString()} objects (${source})`;
+      const restoredCount = restorePlacedObjectsFromStorage();
+      setStatus(
+        restoredCount > 0
+          ? `Loaded ${state.catalog.length.toLocaleString()} | Restored ${restoredCount}`
+          : `Catalog loaded: ${state.catalog.length.toLocaleString()}`,
+      );
       return;
     } catch (error) {
       lastError = error;
@@ -981,7 +1370,7 @@ async function loadCatalog() {
     throw lastError || new Error('No catalog source could be loaded');
   } catch (error) {
     ui.list.innerHTML = '<div class="muted">Failed to load catalog from SamsObjectFinder API or local file.</div>';
-    ui.selectionInfo.textContent = 'Catalog load failed.';
+    setStatus('Catalog load failed.');
     console.error('Catalog load failed:', error);
   }
 }
@@ -995,8 +1384,11 @@ function animate() {
   pulseLight.position.z = Math.sin(t * 0.33) * 18;
   pulseLight.position.y = 7 + Math.sin(t * 1.8) * 0.9;
   applyKeyboardNavigation(delta);
+  updatePlaceEdgeEffects(delta);
+  updatePlaceImpactEffects(delta);
   renderer.render(scene, camera);
 }
 
+renderPlacedList();
 loadCatalog();
 animate();

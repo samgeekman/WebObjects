@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>DayZ Box Editor</title>
+    <title>Sam's DayZ Layout Tool</title>
     <link rel="stylesheet" href="./styles.css" />
     <script async src="https://unpkg.com/es-module-shims@1.10.0/dist/es-module-shims.js"></script>
     <script type="importmap">
@@ -18,7 +18,7 @@
   <body>
     <div id="app">
       <aside class="panel left">
-        <h1>DayZ Box Editor</h1>
+        <h1>Sam's DayZ Layout Tool</h1>
         <label class="field">
           <span>Search object</span>
           <input id="searchInput" placeholder="fuelstation, garage, fence..." />
@@ -32,43 +32,34 @@
       </main>
 
       <aside class="panel right">
-        <h2>Selection</h2>
-        <div id="selectionInfo" class="muted">No object selected.</div>
-
-        <h3>Placement</h3>
-        <p class="muted">Drag an image tile from the left panel and drop it onto the plane to place.</p>
-
-        <h3>Transform</h3>
-        <div class="row">
-          <button data-mode="translate">Move</button>
-          <button data-mode="rotate">Rotate</button>
-          <button data-mode="scale">Scale</button>
+        <h2>Placed Objects</h2>
+        <div id="placedList" class="placed-list"></div>
+        <div class="right-bottom">
+          <h3>Export</h3>
+          <div class="row export-actions">
+            <button id="exportScene" class="export-action">Export to File</button>
+            <button id="copyExport" class="export-action">Copy to Clipboard</button>
+            <label class="file-input import-large export-action">
+              Import
+              <input id="importScene" type="file" accept="application/json" />
+            </label>
+          </div>
+          <h3>Camera Controls</h3>
+          <p class="muted">W/S: forward/back, A/D: strafe, Q/Z: up/down, Shift: faster movement.</p>
+          <p class="muted">Space: switch between camera mode and cursor mode.</p>
         </div>
-        <h3>Controls</h3>
-        <img class="legend-image" src="./public/images/controls-legend.svg" alt="Control legend for icons and keys" />
-        <p class="muted">Icons: move, rotate, scale. Camera keys: W/A/S/D/Q/Z. Press Space to toggle mouselook/cursor mode.</p>
-
-        <h3>Dimensions (meters)</h3>
-        <div class="grid3">
-          <label>X <input id="dimX" type="number" step="0.01" /></label>
-          <label>Y <input id="dimY" type="number" step="0.01" /></label>
-          <label>Z <input id="dimZ" type="number" step="0.01" /></label>
-        </div>
-        <button id="applyDims">Apply Dimensions</button>
-
-        <h3>Scene</h3>
-        <div class="row">
-          <button id="exportScene">Export JSON</button>
-          <button id="copyExport">Copy Export</button>
-          <button id="undoAction">Undo</button>
-          <label class="file-input">
-            Import JSON
-            <input id="importScene" type="file" accept="application/json" />
-          </label>
-        </div>
-        <button id="deleteSelected">Delete Selected</button>
       </aside>
     </div>
+    <footer id="bottomToolbar">
+      <div class="toolbar-left">
+        <button data-mode="translate">Move</button>
+        <button data-mode="rotate">Rotate</button>
+        <button id="deleteSelected">Delete</button>
+        <button id="duplicateSelected">Duplicate</button>
+        <button id="undoAction">Undo</button>
+      </div>
+      <div id="statusText" class="muted toolbar-status">Ready.</div>
+    </footer>
 
     <script type="module" src="./src/main.js"></script>
   </body>
